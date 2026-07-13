@@ -144,6 +144,13 @@ class CSPFlow(BaseModule):
         self.cost_sym_lattice = self.hparams.get("cost_sym_lattice", self.hparams.cost_lattice)
         self.cost_sym_coord = self.hparams.get("cost_sym_coord", self.hparams.cost_coord)
 
+        self.use_eqm = self.hparams.get("use_eqm", True)
+        self.ct_a_coord     = self.hparams.get("ct_a_coord",   0.8)   # paper default
+        self.ct_lam_coord   = self.hparams.get("ct_lam_coord", 4.0)
+        self.ct_a_lattice   = self.hparams.get("ct_a_lattice", 0.8)   # start = coord; sweep down later
+        self.ct_lam_lattice = self.hparams.get("ct_lam_lattice", 4.0)
+ 
+
         if self.ot:
             hydra.utils.log.info("Using optimal transport")
         if self.lattice_polar:
@@ -162,6 +169,18 @@ class CSPFlow(BaseModule):
             hydra.utils.log.warning(f"cost_lattice={self.hparams.cost_lattice}, setting to keep lattice.")
         if self.keep_coords:
             hydra.utils.log.warning(f"cost_coords={self.hparams.cost_coord}, setting to keep coords.")
+        
+        if self.use_eqm:
+            hydra.utils.log.info(
+                f"Using EqM objective: c(gamma) truncated-decay "
+                f"[coord a={self.ct_a_coord}, lam={self.ct_lam_coord}] "
+                f"[lattice a={self.ct_a_lattice}, lam={self.ct_lam_lattice}]"
+            )
+    
+    
+    def get_ct(self, t, a=0.8, lam=4.0):
+        ramp = torch.clamp((1.0 - t) / (1.0 - a), max=1.0)
+        return lam * ramp
 
     def sample_lengths(self, num_atoms, batch_size):
         loc = math.log(2)
@@ -282,6 +301,17 @@ class CSPFlow(BaseModule):
         else:
             input_atom_types = batch.atom_types
 
+        
+        if self.use_eqm:
+            ct_l = self.get_ct(times, self.ct_a_lattice, self.ct_lam_lattice)   # [B]
+            ct_f = self.get_ct(times, self.ct_a_coord,   self.ct_lam_coord)     # [B]
+            tar_l = tar_l * ct_l[:, None]                                       # polar: [B,6]
+            tar_f = tar_f * ct_f.repeat_interleave(batch.num_atoms)[:, None]    # [N,1] * [N,3]
+            if self.pred_type:
+                # types are out of scope for flow_polar CSP; scale for consistency if used.
+                tar_t = tar_t * ct_f.repeat_interleave(batch.num_atoms)[:, None]
+ 
+
         # Replace inputs if fixed
         if self.keep_coords:
             input_frac_coords = frac_coords
@@ -298,7 +328,7 @@ class CSPFlow(BaseModule):
             num_atoms=batch.num_atoms,
             node2graph=batch.batch,
             lattices_mat=input_lattice_mat,
-            cemb=cemb, guide_indicator=guide_indicator,
+            cemb=cemb, guide_indicator=guide_indicator, uncond=self.use_eqm,
         )
         if self.pred_type:
             pred_l, pred_f, pred_t = pred
@@ -421,6 +451,7 @@ class CSPFlow(BaseModule):
         anneal_lattice=False, anneal_coords=False, anneal_type=False,
         anneal_slope=0.0, anneal_offset=0.0,
         guide_factor=None,
+        eta=None, sampler="gd", mu=0.3,
         **kwargs,
     ):
         if N is None:
@@ -507,6 +538,15 @@ class CSPFlow(BaseModule):
         else:
             t_t = batch.atom_types
 
+        
+        if self.use_eqm:
+            if eta is None:
+                eta = 1.0 / N                    # start near the old step scale, then tune
+            m_l = torch.zeros_like(l_t)          # NAG momentum (unused for plain gd)
+            m_f = torch.zeros_like(f_t)
+            if self.pred_type:
+                m_t = torch.zeros_like(t_t)
+
 
         for t in tqdm(range(1, N + 1)):
 
@@ -520,6 +560,27 @@ class CSPFlow(BaseModule):
                 l_t = l_T
                 lattices_mat_t = lattices_mat_T
 
+            if self.use_eqm:
+                if sampler == "nag":
+                    l_in = l_t + eta * mu * m_l
+                    f_in = (f_t + eta * mu * m_f) % 1.0
+                    t_in = t_t + eta * mu * m_t if self.pred_type else t_t
+                else:
+                    l_in, f_in, t_in = l_t, f_t, t_t
+                if self.keep_coords:
+                    f_in = f_T
+                if self.keep_lattice:
+                    l_in = l_T
+                    lattices_mat_in = lattices_mat_T
+                else:
+                    lattices_mat_in = lattice_polar_build_torch(l_in) if self.lattice_polar else l_in
+                dec_f, dec_l, dec_lm, dec_t = f_in, l_in, lattices_mat_in, t_in
+                dec_uncond = True
+            else:
+                dec_f, dec_l, dec_lm, dec_t = f_t, l_t, lattices_mat_t, t_t
+                dec_uncond = False
+ 
+
             # ========= pred each step start =========
             if (guide_factor is not None) and (abs(guide_factor - 1) < 1e-4):  # no need to compute
                 pred_l = 0.0
@@ -529,13 +590,13 @@ class CSPFlow(BaseModule):
             else:
                 pred = self.decoder(
                     t=time_emb,
-                    atom_types=t_t,
-                    frac_coords=f_t,
-                    lattices_rep=l_t,
+                    atom_types=dec_t,
+                    frac_coords=dec_f,
+                    lattices_rep=dec_l,
                     num_atoms=batch.num_atoms,
                     node2graph=batch.batch,
-                    lattices_mat=lattices_mat_t,
-                    cemb=None, guide_indicator=None,
+                    lattices_mat=dec_lm,
+                    cemb=None, guide_indicator=None, uncond=dec_uncond,
                 )
                 pred = self.post_decoder_on_sample(
                     pred,
@@ -551,13 +612,13 @@ class CSPFlow(BaseModule):
             if guide_factor is not None:
                 pred = self.decoder(
                     t=time_emb,
-                    atom_types=t_t,
-                    frac_coords=f_t,
-                    lattices_rep=l_t,
+                    atom_types=dec_t,
+                    frac_coords=dec_f,
+                    lattices_rep=dec_l,
                     num_atoms=batch.num_atoms,
                     node2graph=batch.batch,
-                    lattices_mat=lattices_mat_t,
-                    cemb=cemb, guide_indicator=guide_indicator,
+                    lattices_mat=dec_lm,
+                    cemb=cemb, guide_indicator=guide_indicator, uncond=dec_uncond,
                 )
                 pred = self.post_decoder_on_sample(
                     pred,
@@ -575,11 +636,22 @@ class CSPFlow(BaseModule):
             # ========= pred each step end =========
 
             # ========= update each step start =========
-            l_t = l_t + pred_l / N if not self.keep_lattice else l_t
-            f_t = f_t + pred_f / N if not self.keep_coords else f_t
-            f_t = f_t % 1.0
-            if self.pred_type:
-                t_t = t_t + pred_t / N
+            if self.use_eqm:
+                if not self.keep_lattice:
+                    l_t = l_t + eta * pred_l
+                    m_l = pred_l
+                if not self.keep_coords:
+                    f_t = (f_t + eta * pred_f) % 1.0
+                    m_f = pred_f
+                if self.pred_type:
+                    t_t = t_t + eta * pred_t
+                    m_t = pred_t
+            else:
+                l_t = l_t + pred_l / N if not self.keep_lattice else l_t
+                f_t = f_t + pred_f / N if not self.keep_coords else f_t
+                f_t = f_t % 1.0
+                if self.pred_type:
+                    t_t = t_t + pred_t / N
             # ========= update each step end =========
 
             # ========= build trajectory start =========
