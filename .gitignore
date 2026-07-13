@@ -166,4 +166,7 @@ wandb/
 runs/
 clean/
 hydra/
-log/
+log/data/mp_20/test_ori.pt
+data/mp_20/train_ori.pt
+data/mp_20/val_ori.pt
+data/mp_20/test_ori.pt
