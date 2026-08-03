@@ -43,6 +43,9 @@ from diffcsp.pl_modules.hungarian import HungarianMatcher
 from diffcsp.pl_modules.lattice_utils import LatticeDecompNN
 from diffcsp.pl_modules.ode_solvers import str_to_solver
 from diffcsp.pl_modules.symmetrize import SymmetrizeRotavg
+from diffcsp.pl_modules.time_scheduler import TimeScheduler
+from diffcsp.pl_modules.type_module import TypeTableModule
+
 
 MAX_ATOMIC_NUM = 100
 
@@ -106,6 +109,20 @@ class CSPFlow(BaseModule):
             latent_dim=self.hparams.latent_dim + self.time_dim,  # 0 + time
             _recursive_=False,
         )
+
+        self.time_scheduler = TimeScheduler(self.hparams.get("time_scheduler", ""))
+
+        self.guide_threshold = self.hparams.get("guide_threshold", None)
+        if self.guide_threshold is not None:
+            self.cond_emb = MultiEmbedding(**self.hparams.conditions)
+            cemb_dim = self.cond_emb.n_out
+        else:
+            self.cond_emb = None
+            cemb_dim = 1
+        self.pred_type = self.hparams.decoder.get('pred_type', False)
+        self.type_encoding = self.hparams.get('type_encoding', None)
+        if self.type_encoding == "table":
+            self.type_encoding = TypeTableModule()
         self.beta_scheduler = hydra.utils.instantiate(self.hparams.beta_scheduler)
         self.sigma_scheduler = hydra.utils.instantiate(self.hparams.sigma_scheduler)
         self.keep_lattice = self.hparams.cost_lattice < 1e-5
@@ -315,11 +332,15 @@ class CSPFlow(BaseModule):
         return 1 + slope * F.relu(t - offset)
 
     def post_decoder_on_sample(
-        self, pred_l, pred_f,
+        self, pred,
         batch, t,
-        anneal_lattice=False, anneal_coords=False,
+        anneal_lattice=False, anneal_coords=False, anneal_type=False,
         anneal_slope=0.0, anneal_offset=0.0,
     ):
+        if self.pred_type:
+            pred_l, pred_f, pred_t = pred
+        else:
+            pred_l, pred_f = pred
         if self.symmetrize_anchor:
             if self.lattice_polar:
                 pred_l = self.latticedecompnn.proj_kdiff_to_spacegroup(pred_l, batch.spacegroup)
@@ -345,13 +366,19 @@ class CSPFlow(BaseModule):
             pred_l *= anneal_factor
         if anneal_coords:
             pred_f *= anneal_factor
-        return pred_l, pred_f
+        if self.pred_type:
+            if anneal_type:
+                pred_t *= anneal_factor
+            return pred_l, pred_f, pred_t
+        else:
+            return pred_l, pred_f
 
     @torch.no_grad()
     def sample(
         self, batch, step_lr=None, N=None,
-        anneal_lattice=False, anneal_coords=False,
+        anneal_lattice=False, anneal_coords=False, anneal_type=False,
         anneal_slope=0.0, anneal_offset=0.0,
+        guide_factor=None,
         **kwargs,
     ):
         if N is None:
@@ -359,7 +386,19 @@ class CSPFlow(BaseModule):
 
         batch_size = batch.num_graphs
 
+        if self.guide_threshold is None and guide_factor is not None:
+            raise ValueError("Model is not trained with guidance but trying to sample with guidance.")
+        if self.guide_threshold is not None and guide_factor is None:
+            raise ValueError("Model is trained with guidance but trying to sample with no guidance.")
+
+        if guide_factor is not None:
+            if self.cond_emb is None:
+                raise Exception("Model is not trained with guidance")
+            cemb = self.cond_emb(**{key: batch.get(key) for key in self.cond_emb.cond_keys})
+            guide_indicator = torch.ones(batch_size, device=self.device)
+
         # time stamp T
+        # lattice
         if self.lattice_polar:
             l_T = self.sample_lattice_polar(batch_size)
             if self.symmetrize_anchor:
@@ -374,7 +413,7 @@ class CSPFlow(BaseModule):
             elif self.symmetrize_rotavg:
                 raise NotImplementedError("symmetrize_rotavg")
             lattices_mat_T = l_T
-
+        # coords
         f_T = torch.rand([batch.num_nodes, 3]).to(self.device)
         if self.symmetrize_anchor:
             f_T_anchor = f_T[batch.anchor_index]
@@ -388,6 +427,16 @@ class CSPFlow(BaseModule):
                 symm_map=batch.symm_map,
                 num_general_ops=batch.num_general_ops,
             ) + batch.ops[:, :3, 3]
+        # types
+        if self.pred_type:
+            if self.type_encoding is None:
+                rd_atom_types_onehot = torch.randn((batch.num_nodes, MAX_ATOMIC_NUM), device=self.device)
+                atom_types = torch.argmax(rd_atom_types_onehot, dim=-1) + 1
+            else:
+                rd_atom_types_onehot = self.type_encoding.get_rd_encoded_types(batch.num_nodes, device=self.device)
+                atom_types = self.type_encoding.decode_types(rd_atom_types_onehot)
+        else:
+            atom_types = batch.atom_types
 
         #
         if self.keep_coords:
@@ -402,7 +451,7 @@ class CSPFlow(BaseModule):
         traj = {
             0: {
                 'num_atoms': batch.num_atoms,
-                'atom_types': batch.atom_types,
+                'atom_types': atom_types,
                 'frac_coords': f_T % 1.0,
                 'lattices': lattices_mat_T,
             }
@@ -411,10 +460,16 @@ class CSPFlow(BaseModule):
         lattices_mat_t = lattices_mat_T.clone().detach()
         l_t = l_T.clone().detach()
         f_t = f_T.clone().detach()
+        if self.pred_type:
+            t_t = rd_atom_types_onehot.clone().detach()
+        else:
+            t_t = batch.atom_types
+
 
         for t in tqdm(range(1, N + 1)):
 
-            times = torch.full((batch_size,), t, device=self.device) / N
+            t_stamp = t / N
+            times = torch.full((batch_size,), t_stamp, device=self.device)
             time_emb = self.time_embedding(times)
 
             if self.keep_coords:
@@ -423,42 +478,97 @@ class CSPFlow(BaseModule):
                 l_t = l_T
                 lattices_mat_t = lattices_mat_T
 
-            pred_l, pred_f = self.decoder(
-                t=time_emb,
-                atom_types=batch.atom_types,
-                frac_coords=f_t,
-                lattices_rep=l_t,
-                num_atoms=batch.num_atoms,
-                node2graph=batch.batch,
-                lattices_mat=lattices_mat_t,
-            )
+            # ========= pred each step start =========
+            if (guide_factor is not None) and (abs(guide_factor - 1) < 1e-4):  # no need to compute
+                pred_l = 0.0
+                pred_f = 0.0
+                if self.pred_type:
+                    pred_t = 0.0
+            else:
+                pred = self.decoder(
+                    t=time_emb,
+                    atom_types=t_t,
+                    frac_coords=f_t,
+                    lattices_rep=l_t,
+                    num_atoms=batch.num_atoms,
+                    node2graph=batch.batch,
+                    lattices_mat=lattices_mat_t,
+                    cemb=None, guide_indicator=None,
+                )
+                pred = self.post_decoder_on_sample(
+                    pred,
+                    batch=batch, t=t_stamp,
+                    anneal_lattice=anneal_lattice, anneal_coords=anneal_coords, anneal_type=anneal_type,
+                    anneal_slope=anneal_slope, anneal_offset=anneal_offset,
+                )
+                if self.pred_type:
+                    pred_l, pred_f, pred_t = pred
+                else:
+                    pred_l, pred_f = pred
 
-            pred_l, pred_f = self.post_decoder_on_sample(
-                pred_l, pred_f,
-                batch=batch, t=t,
-                anneal_lattice=anneal_lattice, anneal_coords=anneal_coords,
-                anneal_slope=anneal_slope, anneal_offset=anneal_offset,
-            )
+            if guide_factor is not None:
+                pred = self.decoder(
+                    t=time_emb,
+                    atom_types=t_t,
+                    frac_coords=f_t,
+                    lattices_rep=l_t,
+                    num_atoms=batch.num_atoms,
+                    node2graph=batch.batch,
+                    lattices_mat=lattices_mat_t,
+                    cemb=cemb, guide_indicator=guide_indicator,
+                )
+                pred = self.post_decoder_on_sample(
+                    pred,
+                    batch=batch, t=t_stamp,
+                    anneal_lattice=anneal_lattice, anneal_coords=anneal_coords,
+                    anneal_slope=anneal_slope, anneal_offset=anneal_offset,
+                )
+                if self.pred_type:
+                    pred_l_guide, pred_f_guide, pred_t_guide = pred
+                    pred_t = guide_factor * pred_t_guide + (1 - guide_factor) * pred_t
+                else:
+                    pred_l_guide, pred_f_guide = pred
+                pred_l = guide_factor * pred_l_guide + (1 - guide_factor) * pred_l
+                pred_f = guide_factor * pred_f_guide + (1 - guide_factor) * pred_f
+            # ========= pred each step end =========
 
-            f_t = f_t + pred_f / N if not self.keep_coords else f_t
+            # ========= update each step start =========
             l_t = l_t + pred_l / N if not self.keep_lattice else l_t
+            f_t = f_t + pred_f / N if not self.keep_coords else f_t
             f_t = f_t % 1.0
+            if self.pred_type:
+                t_t = t_t + pred_t / N
+            # ========= update each step end =========
 
+            # ========= build trajectory start =========
             if self.lattice_polar:
                 lattices_mat_t = lattice_polar_build_torch(l_t)
             else:
                 lattices_mat_t = l_t
 
+            if self.pred_type:
+                if self.type_encoding is None:
+                    atom_types = torch.argmax(t_t, dim=-1) + 1
+                else:
+                    atom_types = self.type_encoding.decode_types(t_t)
+
             traj[t] = {
                 'num_atoms': batch.num_atoms,
-                'atom_types': batch.atom_types,
+                'atom_types': atom_types,
                 'frac_coords': f_t,
                 'lattices': lattices_mat_t,
             }
+            # ========= build trajectory end =========
+
+        # stack final trajectory
+        if self.pred_type:
+            stack_atom_types = torch.stack([traj[i]['atom_types'] for i in range(0, N + 1)])
+        else:
+            stack_atom_types = batch.atom_types
 
         traj_stack = {
             'num_atoms': batch.num_atoms,
-            'atom_types': batch.atom_types,
+            'atom_types': stack_atom_types,
             'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in range(0, N + 1)]),
             'all_lattices': torch.stack([traj[i]['lattices'] for i in range(0, N + 1)]),
         }
