@@ -127,5 +127,10 @@ if __name__ == '__main__':
     guidance_group = parser.add_argument_group('guidance')
     guidance_group.add_argument('--guide-factor', type=float, help='guidance factor (default: None)')
 
+    eqm_group = parser.add_argument_group('EqM sampling')
+    eqm_group.add_argument('--eta', type=float, default=None, help="EqM step size, independent of N")
+    eqm_group.add_argument('--sampler', choices=['gd','nag'], default='gd')
+    eqm_group.add_argument('--mu', type=float, default=0.3)
+
     args = parser.parse_args()
     main(args)

@@ -402,6 +402,7 @@ class CSPFlow(BaseModule):
         anneal_lattice=False, anneal_coords=False, anneal_type=False,
         anneal_slope=0.0, anneal_offset=0.0,
         guide_factor=None,
+        eta=None, sampler="gd", mu=0.3,
         **kwargs,
     ):
         if N is None:
@@ -488,13 +489,13 @@ class CSPFlow(BaseModule):
         else:
             t_t = batch.atom_types
 
-
         if self.use_eqm:
             if eta is None:
-                eta = 1.0 / N                    # start near the old step scale, then tune
-            m_l = torch.zeros_like(l_t)          # NAG momentum (unused for plain gd)
+                eta = 1.0 / N
+            m_l = torch.zeros_like(l_t)
             m_f = torch.zeros_like(f_t)
-
+            if self.pred_type:
+                m_t = torch.zeros_like(t_t)
 
         for t in tqdm(range(1, N + 1)):
 
@@ -507,6 +508,26 @@ class CSPFlow(BaseModule):
             if self.keep_lattice:
                 l_t = l_T
                 lattices_mat_t = lattices_mat_T
+            
+            if self.use_eqm:
+                if sampler == "nag":
+                    l_in = l_t + eta * mu * m_l
+                    f_in = (f_t + eta * mu * m_f) % 1.0
+                    t_in = t_t + eta * mu * m_t if self.pred_type else t_t
+                else:
+                    l_in, f_in, t_in = l_t, f_t, t_t
+                if self.keep_coords:
+                    f_in = f_T
+                if self.keep_lattice:
+                    l_in = l_T
+                    lattices_mat_in = lattices_mat_T
+                else:
+                    lattices_mat_in = lattice_polar_build_torch(l_in) if self.lattice_polar else l_in
+                dec_f, dec_l, dec_lm, dec_t = f_in, l_in, lattices_mat_in, t_in
+                dec_uncond = True
+            else:
+                dec_f, dec_l, dec_lm, dec_t = f_t, l_t, lattices_mat_t, t_t
+                dec_uncond = False
 
             # ========= pred each step start =========
             if (guide_factor is not None) and (abs(guide_factor - 1) < 1e-4):  # no need to compute
@@ -517,14 +538,16 @@ class CSPFlow(BaseModule):
             else:
                 pred = self.decoder(
                     t=time_emb,
-                    atom_types=t_t,
-                    frac_coords=f_t,
-                    lattices_rep=l_t,
+                    atom_types=dec_t,
+                    frac_coords=dec_f,
+                    lattices_rep=dec_l,
                     num_atoms=batch.num_atoms,
                     node2graph=batch.batch,
-                    lattices_mat=lattices_mat_t,
+                    lattices_mat=dec_lm,
                     cemb=None, guide_indicator=None,
+                    uncond=dec_uncond,          # <-- ADD
                 )
+
                 pred = self.post_decoder_on_sample(
                     pred,
                     batch=batch, t=t_stamp,
@@ -546,6 +569,7 @@ class CSPFlow(BaseModule):
                     node2graph=batch.batch,
                     lattices_mat=lattices_mat_t,
                     cemb=cemb, guide_indicator=guide_indicator,
+                    uncond=dec_uncond,
                 )
                 pred = self.post_decoder_on_sample(
                     pred,
@@ -562,12 +586,25 @@ class CSPFlow(BaseModule):
                 pred_f = guide_factor * pred_f_guide + (1 - guide_factor) * pred_f
             # ========= pred each step end =========
 
+
             # ========= update each step start =========
-            l_t = l_t + pred_l / N if not self.keep_lattice else l_t
-            f_t = f_t + pred_f / N if not self.keep_coords else f_t
-            f_t = f_t % 1.0
-            if self.pred_type:
-                t_t = t_t + pred_t / N
+            if self.use_eqm:
+                if not self.keep_lattice:
+                    l_t = l_t + eta * pred_l
+                    m_l = pred_l
+                if not self.keep_coords:
+                    f_t = (f_t + eta * pred_f) % 1.0
+                    m_f = pred_f
+                if self.pred_type:
+                    t_t = t_t + eta * pred_t
+                    m_t = pred_t
+            else:
+                l_t = l_t + pred_l / N if not self.keep_lattice else l_t
+                f_t = f_t + pred_f / N if not self.keep_coords else f_t
+                f_t = f_t % 1.0
+                if self.pred_type:
+                    t_t = t_t + pred_t / N
+            # ========= update each step end =========
             # ========= update each step end =========
 
             # ========= build trajectory start =========
