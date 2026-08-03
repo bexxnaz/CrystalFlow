@@ -143,6 +143,12 @@ class CSPFlow(BaseModule):
         self.cost_sym_lattice = self.hparams.get("cost_sym_lattice", self.hparams.cost_lattice)
         self.cost_sym_coord = self.hparams.get("cost_sym_coord", self.hparams.cost_coord)
 
+        self.use_eqm = self.hparams.get("use_eqm", True)
+        self.ct_a_coord     = self.hparams.get("ct_a_coord",   0.8)   # paper default
+        self.ct_lam_coord   = self.hparams.get("ct_lam_coord", 4.0)
+        self.ct_a_lattice   = self.hparams.get("ct_a_lattice", 0.8)   # start = coord; sweep down later
+        self.ct_lam_lattice = self.hparams.get("ct_lam_lattice", 4.0)
+
         if self.ot:
             hydra.utils.log.info("Using optimal transport")
         if self.lattice_polar:
@@ -161,6 +167,17 @@ class CSPFlow(BaseModule):
             hydra.utils.log.warning(f"cost_lattice={self.hparams.cost_lattice}, setting to keep lattice.")
         if self.keep_coords:
             hydra.utils.log.warning(f"cost_coords={self.hparams.cost_coord}, setting to keep coords.")
+        
+        if self.use_eqm:
+            hydra.utils.log.info(
+                f"Using EqM objective: c(gamma) truncated-decay "
+                f"[coord a={self.ct_a_coord}, lam={self.ct_lam_coord}] "
+                f"[lattice a={self.ct_a_lattice}, lam={self.ct_lam_lattice}]"
+            )
+    
+    def get_ct(self, t, a=0.8, lam=4.0):
+        ramp = torch.clamp((1.0 - t) / (1.0 - a), max=1.0)
+        return lam * ramp
 
     def sample_lengths(self, num_atoms, batch_size):
         loc = math.log(2)
@@ -252,6 +269,12 @@ class CSPFlow(BaseModule):
         else:
             input_lattice_mat = input_lattice_rep
 
+        if self.use_eqm:
+            ct_l = self.get_ct(times, self.ct_a_lattice, self.ct_lam_lattice)   # [B]
+            ct_f = self.get_ct(times, self.ct_a_coord,   self.ct_lam_coord)     # [B]
+            tar_l = tar_l * ct_l[:, None]                                       # polar: [B,6]
+            tar_f = tar_f * ct_f.repeat_interleave(batch.num_atoms)[:, None]    # [N,1] * [N,3]
+   
         # Replace inputs if fixed
         if self.keep_coords:
             input_frac_coords = frac_coords
@@ -267,7 +290,7 @@ class CSPFlow(BaseModule):
             lattices_rep=input_lattice_rep,
             num_atoms=batch.num_atoms,
             node2graph=batch.batch,
-            lattices_mat=input_lattice_mat,
+            lattices_mat=input_lattice_mat,uncond=self.use_eqm
         )
 
         loss_sym_l = 0.0
@@ -464,6 +487,13 @@ class CSPFlow(BaseModule):
             t_t = rd_atom_types_onehot.clone().detach()
         else:
             t_t = batch.atom_types
+
+
+        if self.use_eqm:
+            if eta is None:
+                eta = 1.0 / N                    # start near the old step scale, then tune
+            m_l = torch.zeros_like(l_t)          # NAG momentum (unused for plain gd)
+            m_f = torch.zeros_like(f_t)
 
 
         for t in tqdm(range(1, N + 1)):
