@@ -14,28 +14,44 @@ from pymatgen.core.structure import Structure
 from pymatgen.core.lattice import Lattice
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pyxtal.symmetry import Group
-from diffcsp.common.data_utils import lattice_params_to_matrix_torch
+
 
 import copy
 
 import numpy as np
+from diffcsp.common.data_utils import (
+    EPSILON,
+    cart_to_frac_coords,
+    frac_to_cart_coords,
+    lattice_params_to_matrix_torch,
+    lattice_polar_build_torch,
+    lattice_polar_decompose_torch,
+    lengths_angles_to_volume,
+    mard,
+    min_distance_sqr_pbc,
+)
 
-def perturb_batch(batch, coord_noise, lattice_noise, device):
+def perturb_batch(batch, coord_noise, lattice_noise, device, model):
     frac_coords = batch.frac_coords.clone().to(device)
-    lengths = batch.lengths.clone().to(device)
-    angles = batch.angles.clone().to(device)
- 
     frac_coords_distorted = (frac_coords + torch.randn_like(frac_coords) * coord_noise) % 1.0
-    # multiplicative noise on lengths keeps them positive; additive on angles
-    lengths_distorted = lengths * (1.0 + torch.randn_like(lengths) * lattice_noise)
-    angles_distorted = angles + torch.randn_like(angles) * lattice_noise * 10.0  # degrees, coarser scale
- 
-    lattices_mat_distorted = lattice_params_to_matrix_torch(lengths_distorted, angles_distorted)
- 
+
+    if model.lattice_polar:
+        lattice_polar_gt = batch.lattice_polar.clone().to(device)
+        # perturb in the SAME space and SAME scale convention the model trained on
+        lattice_polar_distorted = lattice_polar_gt + torch.randn_like(lattice_polar_gt) * lattice_noise
+        lattices_mat_distorted = lattice_polar_build_torch(lattice_polar_distorted)
+    else:
+        lengths = batch.lengths.clone().to(device)
+        angles = batch.angles.clone().to(device)
+        lengths_distorted = lengths * (1.0 + torch.randn_like(lengths) * lattice_noise)
+        angles_distorted = angles + torch.randn_like(angles) * lattice_noise * 10.0
+        lattices_mat_distorted = lattice_params_to_matrix_torch(lengths_distorted, angles_distorted)
+
     return {
         'frac_coords': frac_coords_distorted,
         'lattices_mat': lattices_mat_distorted,
     }
+
 
 
 def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=False, **sample_kwargs):
@@ -53,10 +69,9 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
         batch_lattices = []
         for eval_idx in range(num_evals):
             print(f'batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}')
-            distorted = perturb_batch(batch, coord_noise, lattice_noise, device)
+            distorted = perturb_batch(batch, coord_noise, lattice_noise, device, model)   # <-- model added
 
             if null_baseline:
-                # skip the model entirely -- "prediction" IS the distortion
                 out_frac = distorted['frac_coords'].detach().cpu()
                 out_lattices = distorted['lattices_mat'].detach().cpu()
                 out_num_atoms = batch.num_atoms.detach().cpu()
