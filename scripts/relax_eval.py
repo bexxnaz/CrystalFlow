@@ -14,6 +14,7 @@ from pymatgen.core.structure import Structure
 from pymatgen.core.lattice import Lattice
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pyxtal.symmetry import Group
+from diffcsp.common.data_utils import lattice_params_to_matrix_torch
 
 import copy
 
