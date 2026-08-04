@@ -403,6 +403,7 @@ class CSPFlow(BaseModule):
         anneal_slope=0.0, anneal_offset=0.0,
         guide_factor=None,
         eta=None, sampler="gd", mu=0.3,
+        init_structure=None,
         **kwargs,
     ):
         if N is None:
@@ -451,6 +452,18 @@ class CSPFlow(BaseModule):
                 symm_map=batch.symm_map,
                 num_general_ops=batch.num_general_ops,
             ) + batch.ops[:, :3, 3]
+
+        
+        if init_structure is not None:
+            f_T = init_structure['frac_coords'].to(self.device) % 1.0
+            if self.lattice_polar:
+                l_T = init_structure['lattice_polar'].to(self.device)
+                lattices_mat_T = lattice_polar_build_torch(l_T)
+            else:
+                lattices_mat_T = init_structure['lattices_mat'].to(self.device)
+                l_T = lattices_mat_T
+
+       
         # types
         if self.pred_type:
             if self.type_encoding is None:
