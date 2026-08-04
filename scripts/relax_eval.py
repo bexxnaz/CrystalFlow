@@ -38,7 +38,7 @@ def perturb_batch(batch, coord_noise, lattice_noise, device):
     }
 
 
-def relax(loader, model, num_evals, coord_noise, lattice_noise, **sample_kwargs):
+def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=False, **sample_kwargs):
     frac_coords = []
     num_atoms = []
     atom_types = []
@@ -54,11 +54,24 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, **sample_kwargs)
         for eval_idx in range(num_evals):
             print(f'batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}')
             distorted = perturb_batch(batch, coord_noise, lattice_noise, device)
-            outputs, traj = model.sample(batch, init_structure=distorted, **sample_kwargs)
-            batch_frac_coords.append(outputs['frac_coords'].detach().cpu())
-            batch_num_atoms.append(outputs['num_atoms'].detach().cpu())
-            batch_atom_types.append(outputs['atom_types'].detach().cpu())
-            batch_lattices.append(outputs['lattices'].detach().cpu())
+
+            if null_baseline:
+                # skip the model entirely -- "prediction" IS the distortion
+                out_frac = distorted['frac_coords'].detach().cpu()
+                out_lattices = distorted['lattices_mat'].detach().cpu()
+                out_num_atoms = batch.num_atoms.detach().cpu()
+                out_atom_types = batch.atom_types.detach().cpu()
+            else:
+                outputs, traj = model.sample(batch, init_structure=distorted, **sample_kwargs)
+                out_frac = outputs['frac_coords'].detach().cpu()
+                out_lattices = outputs['lattices'].detach().cpu()
+                out_num_atoms = outputs['num_atoms'].detach().cpu()
+                out_atom_types = outputs['atom_types'].detach().cpu()
+
+            batch_frac_coords.append(out_frac)
+            batch_num_atoms.append(out_num_atoms)
+            batch_atom_types.append(out_atom_types)
+            batch_lattices.append(out_lattices)
 
         frac_coords.append(torch.stack(batch_frac_coords, dim=0))
         num_atoms.append(torch.stack(batch_num_atoms, dim=0))
@@ -67,14 +80,12 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, **sample_kwargs)
 
         input_data_list = input_data_list + batch.to_data_list()
 
-
     frac_coords = torch.cat(frac_coords, dim=1)
     num_atoms = torch.cat(num_atoms, dim=1)
     atom_types = torch.cat(atom_types, dim=1)
     lattices = torch.cat(lattices, dim=1)
     lengths, angles = lattices_to_params_shape(lattices)
     input_data_batch = Batch.from_data_list(input_data_list)
-
 
     return (
         frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch
@@ -99,6 +110,7 @@ def main(args):
     (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch) = relax(
         test_loader, model, num_evals=args.num_evals,
         coord_noise=args.coord_noise, lattice_noise=args.lattice_noise,
+        null_baseline=args.null_baseline,
         N=N, eta=args.eta, sampler=args.sampler, mu=args.mu,
         anneal_lattice=args.anneal_lattice, anneal_coords=args.anneal_coords, anneal_type=args.anneal_type, anneal_slope=args.anneal_slope, anneal_offset=args.anneal_offset,
         guide_factor=args.guide_factor,
@@ -159,6 +171,10 @@ if __name__ == '__main__':
                                 help='stddev of fractional-coord Gaussian rattle')
     perturb_group.add_argument('--lattice_noise', type=float, default=0.02,
                                 help='relative stddev on lengths / scale factor on angle noise (degrees)')
+
+
+    parser.add_argument('--null_baseline', action='store_true',
+                     help='skip the model, evaluate the distortion itself (sanity check)')
 
     args = parser.parse_args()
     main(args)
