@@ -129,6 +129,7 @@ def main(args):
         N=N, eta=args.eta, sampler=args.sampler, mu=args.mu,
         anneal_lattice=args.anneal_lattice, anneal_coords=args.anneal_coords, anneal_type=args.anneal_type, anneal_slope=args.anneal_slope, anneal_offset=args.anneal_offset,
         guide_factor=args.guide_factor,
+        grad_stop=args.grad_stop, min_steps=args.min_steps
     )
 
     if args.label == '':
@@ -190,6 +191,10 @@ if __name__ == '__main__':
 
     parser.add_argument('--null_baseline', action='store_true',
                      help='skip the model, evaluate the distortion itself (sanity check)')
+    
+    step_group.add_argument('--grad-stop', dest='grad_stop', type=float, default=None,
+                         help="EqM adaptive early stop: field-norm threshold")
+    step_group.add_argument('--min-steps', dest='min_steps', type=int, default=1)
 
     args = parser.parse_args()
     main(args)
