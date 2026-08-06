@@ -404,6 +404,8 @@ class CSPFlow(BaseModule):
         guide_factor=None,
         eta=None, sampler="gd", mu=0.3,
         init_structure=None,
+        grad_stop=None, 
+        min_steps=1,
         **kwargs,
     ):
         if N is None:
@@ -508,6 +510,9 @@ class CSPFlow(BaseModule):
             m_f = torch.zeros_like(f_t)
             if self.pred_type:
                 m_t = torch.zeros_like(t_t)
+
+
+        last_step = N  
 
         for t in tqdm(range(1, N + 1)):
 
@@ -638,21 +643,36 @@ class CSPFlow(BaseModule):
                 'lattices': lattices_mat_t,
             }
             # ========= build trajectory end =========
+            if self.use_eqm and grad_stop is not None and t >= min_steps:
+                if not self.keep_coords:
+                    coord_field_norm = pred_f.norm(dim=-1).mean()
+                else:
+                    coord_field_norm = torch.tensor(0.0, device=self.device)
+                if not self.keep_lattice:
+                    # mean L2 norm per graph, averaged over the batch
+                    lattice_field_norm = pred_l.flatten(1).norm(dim=-1).mean()
+                else:
+                    lattice_field_norm = torch.tensor(0.0, device=self.device)
+ 
+                if (coord_field_norm < grad_stop) and (lattice_field_norm < grad_stop):
+                    last_step = t
+                    break
 
+        rng = range(0, last_step + 1)
         # stack final trajectory
         if self.pred_type:
-            stack_atom_types = torch.stack([traj[i]['atom_types'] for i in range(0, N + 1)])
+            stack_atom_types = torch.stack([traj[i]['atom_types'] for i in rng])
         else:
             stack_atom_types = batch.atom_types
 
         traj_stack = {
             'num_atoms': batch.num_atoms,
             'atom_types': stack_atom_types,
-            'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in range(0, N + 1)]),
-            'all_lattices': torch.stack([traj[i]['lattices'] for i in range(0, N + 1)]),
+            'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in rng]),
+            'all_lattices': torch.stack([traj[i]['lattices'] for i in rng]),
         }
 
-        return traj[N], traj_stack
+        return traj[last_step], traj_stack
 
     def single_time_decoder(self, t, **kwargs):
         batch_size = kwargs["num_atoms"].shape[0]
