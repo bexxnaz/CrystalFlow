@@ -166,4 +166,4 @@ wandb/
 runs/
 clean/
 hydra/
-log/
+log/data/wbm/test.csv
