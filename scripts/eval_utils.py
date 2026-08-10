@@ -145,7 +145,7 @@ def load_model(model_path, load_data=False, testing=True, test_bs=None):
 
     return model, test_loader, cfg
 
-
+ 
 def get_crystals_list(
         frac_coords, atom_types, lengths, angles, num_atoms):
     """
