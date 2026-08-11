@@ -481,19 +481,18 @@ def get_crystal_array_list(file_path, batch_idx=0):
 
     return crys_array_list, true_crystal_array_list
 
-
-def get_gt_crys_ori(cif):
+def get_gt_crys_ori(cif, compute_fp=True):
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        structure = Structure.from_str(cif,fmt='cif')
+        structure = Structure.from_str(cif, fmt='cif')
     lattice = structure.lattice
     crys_array_dict = {
-        'frac_coords':structure.frac_coords,
-        'atom_types':np.array([_.Z for _ in structure.species]),
+        'frac_coords': structure.frac_coords,
+        'atom_types': np.array([_.Z for _ in structure.species]),
         'lengths': np.array(lattice.abc),
         'angles': np.array(lattice.angles)
     }
-    return Crystal(crys_array_dict) 
+    return Crystal(crys_array_dict, compute_fp=compute_fp)
 
 def main(args):
     all_metrics = {}
@@ -527,53 +526,81 @@ def main(args):
             gen_crys, gt_crys, eval_model_name=eval_model_name)
         gen_metrics = gen_evaluator.get_metrics()
         all_metrics.update(gen_metrics)
-    
+        
 
     elif 'csp_mbd' in args.tasks:
         recon_file_path = get_file_paths(args.root_path, 'diff', args.label)
         crys_array_list, true_crystal_array_list = get_crystal_array_list(recon_file_path, batch_idx=0)
+
         if args.gt_file != '':
             csv = pd.read_csv(args.gt_file)
-            gt_crys = p_map(get_gt_crys_ori, csv['cif'])
+            cif_list = csv['cif'].tolist()
         else:
-            gt_crys = p_map(lambda x: Crystal(x), true_crystal_array_list, num_cpus=args.njobs)
-        pred_crys = p_map(lambda x: Crystal(x), crys_array_list, num_cpus=args.njobs)
+            cif_list = None  # will use true_crystal_array_list instead
 
-        rec_evaluator = RecEvalMBD(pred_crys, gt_crys, njobs=args.njobs)
-        all_metrics.update(rec_evaluator.get_metrics())
+        n_total = len(crys_array_list)
+        chunk_size = args.chunk_size
+        ckpt_path = os.path.join(args.root_path, f'csp_mbd_partial_{args.label}.json')
 
-    else:
-
-        recon_file_path = get_file_paths(args.root_path, 'diff', args.label)
-        batch_idx = -1 if args.multi_eval else 0
-        crys_array_list, true_crystal_array_list = get_crystal_array_list(
-            recon_file_path, batch_idx = batch_idx)
-        if args.gt_file != '':
-            csv = pd.read_csv(args.gt_file)
-            gt_crys = p_map(get_gt_crys_ori, csv['cif'])
+        # resume from a previous partial run if it exists
+        if Path(ckpt_path).exists():
+            with open(ckpt_path) as f:
+                partial = json.load(f)
+            raw_rmsds = partial['raw_rmsds']
+            start_idx = len(raw_rmsds)
+            print(f'Resuming from checkpoint: {start_idx}/{n_total} already done.')
         else:
-            gt_crys = p_map(lambda x: Crystal(x), true_crystal_array_list, num_cpus=args.njobs)
+            raw_rmsds = []
+            start_idx = 0
 
-        if not args.multi_eval:
-            pred_crys = p_map(lambda x: Crystal(x), crys_array_list, num_cpus=args.njobs)
-        else:
-            pred_crys = []
-            for i in range(len(crys_array_list)):
-                print(f"Processing batch {i}")
-                pred_crys.append(p_map(lambda x: Crystal(x), crys_array_list[i], num_cpus=args.njobs))
+        for chunk_start in range(start_idx, n_total, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_total)
+            print(f'Processing structures {chunk_start}:{chunk_end} / {n_total}')
 
-        if args.multi_eval:
-            rec_evaluator = RecEvalBatch(pred_crys, gt_crys)
-        else:
-            rec_evaluator = RecEval(pred_crys, gt_crys)
+            pred_chunk = p_map(
+                lambda x: Crystal(x, compute_fp=False),
+                crys_array_list[chunk_start:chunk_end],
+                num_cpus=args.njobs,
+            )
+            if cif_list is not None:
+                gt_chunk = p_map(
+                    lambda c: get_gt_crys_ori(c, compute_fp=False),
+                    cif_list[chunk_start:chunk_end],
+                    num_cpus=args.njobs,
+                )
+            else:
+                gt_chunk = p_map(
+                    lambda x: Crystal(x, compute_fp=False),
+                    true_crystal_array_list[chunk_start:chunk_end],
+                    num_cpus=args.njobs,
+                )
 
-        recon_metrics = rec_evaluator.get_metrics()
+            chunk_rmsds = p_map(get_rms_dist_mbd, pred_chunk, gt_chunk, num_cpus=args.njobs)
+            raw_rmsds.extend(chunk_rmsds)
 
-        if hasattr(rec_evaluator, "all_rms_dis"):
-            all_metrics["all_rms_dis"] = rec_evaluator.all_rms_dis.tolist()
+            # checkpoint after every chunk -- a crash only costs you the current chunk
+            with open(ckpt_path, 'w') as f:
+                json.dump({'raw_rmsds': raw_rmsds}, f)
 
-        all_metrics.update(recon_metrics)
+            # free memory explicitly before the next chunk
+            del pred_chunk, gt_chunk, chunk_rmsds
 
+        raw_series = pd.Series(raw_rmsds, dtype=float)
+        mean_rmsd = raw_series.fillna(1.0).mean()
+        median_rmsd = raw_series.fillna(1.0).median()
+        n_matched = int(raw_series.notna().sum())
+
+        all_metrics.update({
+            'mbd_rmsd_mean': float(mean_rmsd),
+            'mbd_rmsd_median': float(median_rmsd),
+            'raw_match_rate': n_matched / len(raw_series),
+            'raw_rmsd_matched_only_mean': float(raw_series.mean()),
+            'n_structures': len(raw_series),
+        })
+
+        # cleanup: remove the partial-progress checkpoint now that we've finished
+        if Path(ckpt_path).exists():
+            os.remove(ckpt_path)
 
 
     print(all_metrics)
@@ -609,5 +636,7 @@ if __name__ == '__main__':
     parser.add_argument('--gt_file',default='')
     parser.add_argument('--multi_eval',action='store_true')
     parser.add_argument('-j', '--njobs', default=32, type=int)
+    parser.add_argument('--chunk_size', type=int, default=5000,
+                     help='structures per chunk for csp_mbd (checkpointed after each chunk)')
     args = parser.parse_args()
     main(args)
