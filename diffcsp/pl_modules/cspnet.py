@@ -388,7 +388,7 @@ class CSPNet(nn.Module):
 
             return edge_index_new, -edge_vector_new
 
-    def forward(self, t, atom_types, frac_coords, lattices_rep, num_atoms, node2graph, lattices_mat=None, cemb=None, guide_indicator=None):
+    def forward(self, t, atom_types, frac_coords, lattices_rep, num_atoms, node2graph, lattices_mat=None, cemb=None, guide_indicator=None, uncond=False):
 
         if lattices_mat is None:
             lattices_mat = lattices_rep
@@ -398,6 +398,9 @@ class CSPNet(nn.Module):
             node_features = self.node_embedding(atom_types)
         else:
             node_features = self.node_embedding(atom_types - 1)
+        
+        if uncond:
+            t = torch.zeros_like(t)          # EqM: kill time/noise conditioning at the source
 
         t_per_atom = t.repeat_interleave(num_atoms, dim=0)
         node_features = torch.cat([node_features, t_per_atom], dim=1)

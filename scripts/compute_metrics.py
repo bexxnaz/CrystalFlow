@@ -170,6 +170,74 @@ def get_rms_dist(pred: Crystal, gt, is_valid, matcher):
     except Exception:
         return None
 
+    
+# Module-level matcher, built once -- NOT per-call, since StructureMatcher
+# construction has nontrivial overhead and this runs over the full test set.
+# stol=1.0, scale=False matches pred_vs_ref_struct_symmetry() in
+# matbench_discovery/metrics/geo_opt.py (ltol=0.2, angle_tol=5 stay at
+# pymatgen defaults -- MBD only overrides stol and scale).
+_MBD_MATCHER = StructureMatcher(stol=1.0, scale=False)
+
+
+def get_rms_dist_mbd(pred: Crystal, gt: Crystal):
+    """Per-structure RMSD under the Matbench Discovery protocol.
+
+    Mirrors pred_vs_ref_struct_symmetry()'s per-material computation:
+    returns raw rmsd on success, None on any failure (unconstructed
+    prediction, matcher returning no fit, or an exception). No fill-value
+    substitution happens here -- that's a separate aggregation-time step,
+    done in RecEvalMBD.get_metrics() to mirror calc_geo_opt_metrics().
+    """
+    if not pred.constructed:
+        return None
+    try:
+        result = _MBD_MATCHER.get_rms_dist(pred.structure, gt.structure)
+    except Exception:
+        result = None
+    if result is None:
+        return None
+    rmsd, max_dist = result
+    return rmsd
+
+
+class RecEvalMBD(object):
+    """Matbench Discovery-faithful RMSD evaluator.
+
+    Two-stage, matching their actual code split across two functions:
+      1. get_rms_dist_mbd()   -- per-structure RMSD, NaN on failure
+                                  (mirrors pred_vs_ref_struct_symmetry)
+      2. get_metrics() below  -- fillna(1.0).mean() aggregation
+                                  (mirrors calc_geo_opt_metrics)
+    """
+
+    def __init__(self, pred_crys, gt_crys, njobs=1):
+        assert len(pred_crys) == len(gt_crys)
+        self.preds = pred_crys
+        self.gts = gt_crys
+        self.njobs = njobs
+
+    def get_metrics(self):
+        if self.njobs > 1:
+            raw = p_map(get_rms_dist_mbd, self.preds, self.gts,
+                        num_cpus=self.njobs, ncols=79)
+        else:
+            raw = [get_rms_dist_mbd(p, g) for p, g in zip(self.preds, self.gts)]
+
+        self.raw_rmsds = raw  # keep around for inspection, mirrors self.rms_dists in RecEval
+
+        raw_series = pd.Series(raw, dtype=float)  # None -> NaN automatically
+
+        mean_rmsd = raw_series.fillna(1.0).mean()      # THE leaderboard-comparable number
+        median_rmsd = raw_series.fillna(1.0).median()
+        n_matched = int(raw_series.notna().sum())
+
+        return {
+            'mbd_rmsd_mean': float(mean_rmsd),
+            'mbd_rmsd_median': float(median_rmsd),
+            'raw_match_rate': n_matched / len(raw_series),
+            'raw_rmsd_matched_only_mean': float(raw_series.mean()),  # for your own transparency, not for direct leaderboard comparison
+            'n_structures': len(raw_series),
+        }
 
 class RecEval(object):
 
@@ -465,6 +533,19 @@ def main(args):
             gen_crys, gt_crys, eval_model_name=eval_model_name)
         gen_metrics = gen_evaluator.get_metrics()
         all_metrics.update(gen_metrics)
+    
+    elif 'csp_mbd' in args.tasks:
+        recon_file_path = get_file_paths(args.root_path, 'diff', args.label)
+        crys_array_list, true_crystal_array_list = get_crystal_array_list(recon_file_path, batch_idx=0)
+        if args.gt_file != '':
+            csv = pd.read_csv(args.gt_file)
+            gt_crys = p_map(get_gt_crys_ori, csv['cif'])
+        else:
+            gt_crys = p_map(lambda x: Crystal(x), true_crystal_array_list, num_cpus=args.njobs)
+        pred_crys = p_map(lambda x: Crystal(x), crys_array_list, num_cpus=args.njobs)
+
+        rec_evaluator = RecEvalMBD(pred_crys, gt_crys, njobs=args.njobs)
+        all_metrics.update(rec_evaluator.get_metrics())
 
 
     else:
