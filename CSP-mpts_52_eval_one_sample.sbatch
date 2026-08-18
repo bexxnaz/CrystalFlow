@@ -2,7 +2,7 @@
 #SBATCH -A berzelius-2026-109
 #SBATCH --gpus=1
 #SBATCH -C thin
-#SBATCH -t 23:00:00
+#SBATCH -t 7:00:00
 #SBATCH -J crystalflow-eval-mpts52
 #SBATCH -o log/%x-%j.out
 #SBATCH -e log/%x-%j.err
@@ -11,9 +11,9 @@ module load Miniforge3/24.7.1-2-hpc1-bdist
 mamba activate crystalflow
 source .env
 
-MODEL_PATH=/proj/berzelius-2022-164/users/x_behri/CrystalFlow/hydra/singlerun/CSP-mp20-new
-DATASET=mp_20
-LABEL=CSP-mp20-eval
+MODEL_PATH=/proj/berzelius-2022-164/users/x_behri/CrystalFlow/hydra/singlerun/CSP-mpts52
+DATASET=mpts_52
+LABEL=CSP-mpts52-one-sample-eval
 
 python scripts/evaluate.py \
   --model_path $MODEL_PATH \
@@ -22,8 +22,8 @@ python scripts/evaluate.py \
   --anneal_coords --anneal_slope 5 \
   --label $LABEL
 
-python scripts/compute_metrics.py \
+  python scripts/compute_metrics.py \
   --root_path $MODEL_PATH \
   --tasks csp \
-  --gt_file data/$DATASET/test.csv \ 
+  --gt_file data/$DATASET/test.csv \
   --label $LABEL

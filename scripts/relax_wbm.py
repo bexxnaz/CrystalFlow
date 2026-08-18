@@ -1,5 +1,3 @@
-# evaluate for CSP
-
 import time
 import argparse
 import torch
@@ -17,33 +15,81 @@ from pymatgen.core.lattice import Lattice
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pyxtal.symmetry import Group
 
+
 import copy
 
 import numpy as np
+from diffcsp.common.data_utils import (
+    EPSILON,
+    cart_to_frac_coords,
+    frac_to_cart_coords,
+    lattice_params_to_matrix_torch,
+    lattice_polar_build_torch,
+    lattice_polar_decompose_torch,
+    lengths_angles_to_volume,
+    mard,
+    min_distance_sqr_pbc,
+)
+
+def perturb_batch(batch, coord_noise, lattice_noise, device, model):
+    frac_coords = batch.frac_coords.clone().to(device)
+    frac_coords_distorted = (frac_coords + torch.randn_like(frac_coords) * coord_noise) % 1.0
+
+    if model.lattice_polar:
+        lattice_polar_gt = batch.lattice_polar.clone().to(device)
+        # perturb in the SAME space and SAME scale convention the model trained on
+        lattice_polar_distorted = lattice_polar_gt + torch.randn_like(lattice_polar_gt) * lattice_noise
+        lattices_mat_distorted = lattice_polar_build_torch(lattice_polar_distorted)
+    else:
+        lengths = batch.lengths.clone().to(device)
+        angles = batch.angles.clone().to(device)
+        lengths_distorted = lengths * (1.0 + torch.randn_like(lengths) * lattice_noise)
+        angles_distorted = angles + torch.randn_like(angles) * lattice_noise * 10.0
+        lattices_mat_distorted = lattice_params_to_matrix_torch(lengths_distorted, angles_distorted)
+
+    return {
+        'frac_coords': frac_coords_distorted,
+        'lattices_mat': lattices_mat_distorted,
+    }
 
 
-def diffusion(loader, model, num_evals, **sample_kwargs):
+
+def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=False, **sample_kwargs):
     frac_coords = []
     num_atoms = []
     atom_types = []
     lattices = []
     input_data_list = []
-    for idx, batch in enumerate(loader):
+    device = next(model.parameters()).device
 
+    for idx, batch in enumerate(loader):
         if torch.cuda.is_available():
             batch.cuda()
-        batch_all_frac_coords = []
-        batch_all_lattices = []
         batch_frac_coords, batch_num_atoms, batch_atom_types = [], [], []
         batch_lattices = []
         for eval_idx in range(num_evals):
-
             print(f'batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}')
-            outputs, traj = model.sample(batch, **sample_kwargs)
-            batch_frac_coords.append(outputs['frac_coords'].detach().cpu())
-            batch_num_atoms.append(outputs['num_atoms'].detach().cpu())
-            batch_atom_types.append(outputs['atom_types'].detach().cpu())
-            batch_lattices.append(outputs['lattices'].detach().cpu())
+            init_structure = {
+            'frac_coords': batch.frac_coords,
+            'lattices_mat': lattice_params_to_matrix_torch(batch.lengths, batch.angles),
+            }
+           
+            if null_baseline:
+                out_frac = distorted['frac_coords'].detach().cpu()
+                out_lattices = distorted['lattices_mat'].detach().cpu()
+                out_num_atoms = batch.num_atoms.detach().cpu()
+                out_atom_types = batch.atom_types.detach().cpu()
+            else:
+                outputs, traj = model.sample(batch, init_structure=init_structure, **sample_kwargs)
+                out_frac = outputs['frac_coords'].detach().cpu()
+                out_lattices = outputs['lattices'].detach().cpu()
+                out_num_atoms = outputs['num_atoms'].detach().cpu()
+                out_atom_types = outputs['atom_types'].detach().cpu()
+
+            batch_frac_coords.append(out_frac)
+            batch_num_atoms.append(out_num_atoms)
+            batch_atom_types.append(out_atom_types)
+            batch_lattices.append(out_lattices)
 
         frac_coords.append(torch.stack(batch_frac_coords, dim=0))
         num_atoms.append(torch.stack(batch_num_atoms, dim=0))
@@ -52,14 +98,12 @@ def diffusion(loader, model, num_evals, **sample_kwargs):
 
         input_data_list = input_data_list + batch.to_data_list()
 
-
     frac_coords = torch.cat(frac_coords, dim=1)
     num_atoms = torch.cat(num_atoms, dim=1)
     atom_types = torch.cat(atom_types, dim=1)
     lattices = torch.cat(lattices, dim=1)
     lengths, angles = lattices_to_params_shape(lattices)
     input_data_batch = Batch.from_data_list(input_data_list)
-
 
     return (
         frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch
@@ -76,18 +120,19 @@ def main(args):
     if torch.cuda.is_available():
         model.to('cuda')
 
-    print('Evaluate the diffusion model.')
+    print('Perturb-and-recover evaluation (relaxation feasibility test).')
 
-    if args.ode_int_steps is not None:
-        args.step_lr = 1 / args.ode_int_steps
-    step_lr = args.step_lr if args.step_lr >= 0 else recommand_step_lr['csp' if args.num_evals == 1 else 'csp_multi'][args.dataset]
+    N = args.ode_int_steps if args.ode_int_steps is not None else round(1 / args.step_lr)
 
     start_time = time.time()
-    (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch) = diffusion(
+    (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch) = relax(
         test_loader, model, num_evals=args.num_evals,
-        step_lr=step_lr, N=args.ode_int_steps,
+        coord_noise=args.coord_noise, lattice_noise=args.lattice_noise,
+        null_baseline=args.null_baseline,
+        N=N, eta=args.eta, sampler=args.sampler, mu=args.mu,
         anneal_lattice=args.anneal_lattice, anneal_coords=args.anneal_coords, anneal_type=args.anneal_type, anneal_slope=args.anneal_slope, anneal_offset=args.anneal_offset,
         guide_factor=args.guide_factor,
+        grad_stop=args.grad_stop, min_steps=args.min_steps
     )
 
     if args.label == '':
@@ -106,6 +151,10 @@ def main(args):
         'angles': angles,
         'time': time.time() - start_time,
     }, model_path / diff_out_name)
+
+    print(f'Saved to {model_path / diff_out_name}')
+
+
 
 
 if __name__ == '__main__':
@@ -135,5 +184,20 @@ if __name__ == '__main__':
     eqm_group.add_argument('--sampler', choices=['gd','nag'], default='gd')
     eqm_group.add_argument('--mu', type=float, default=0.3)
 
+
+    perturb_group = parser.add_argument_group('perturbation')
+    perturb_group.add_argument('--coord_noise', type=float, default=0.02,
+                                help='stddev of fractional-coord Gaussian rattle')
+    perturb_group.add_argument('--lattice_noise', type=float, default=0.02,
+                                help='relative stddev on lengths / scale factor on angle noise (degrees)')
+
+
+    parser.add_argument('--null_baseline', action='store_true',
+                     help='skip the model, evaluate the distortion itself (sanity check)')
+    
+    step_group.add_argument('--grad-stop', dest='grad_stop', type=float, default=None,
+                         help="EqM adaptive early stop: field-norm threshold")
+    step_group.add_argument('--min-steps', dest='min_steps', type=int, default=1)
+
     args = parser.parse_args()
-    main(args)
+    main(args) 

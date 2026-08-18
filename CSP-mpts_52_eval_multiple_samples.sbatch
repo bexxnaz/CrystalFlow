@@ -2,7 +2,7 @@
 #SBATCH -A berzelius-2026-109
 #SBATCH --gpus=1
 #SBATCH -C thin
-#SBATCH -t 23:00:00
+#SBATCH -t 10:00:00
 #SBATCH -J crystalflow-eval-ms-mpts52
 #SBATCH -o log/%x-%j.out
 #SBATCH -e log/%x-%j.err

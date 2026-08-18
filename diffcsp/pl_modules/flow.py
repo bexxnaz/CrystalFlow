@@ -495,7 +495,9 @@ class CSPFlow(BaseModule):
                 symm_map=batch.symm_map,
                 num_general_ops=batch.num_general_ops,
             ) + batch.ops[:, :3, 3]
+
         
+
         if init_structure is not None:
             f_T = init_structure['frac_coords'].to(self.device) % 1.0
             lattices_mat_T = init_structure['lattices_mat'].to(self.device)
@@ -503,6 +505,7 @@ class CSPFlow(BaseModule):
                 l_T = lattice_polar_decompose_torch(lattices_mat_T)
             else:
                 l_T = lattices_mat_T
+
         # types
         if self.pred_type:
             if self.type_encoding is None:
@@ -540,7 +543,7 @@ class CSPFlow(BaseModule):
             t_t = rd_atom_types_onehot.clone().detach()
         else:
             t_t = batch.atom_types
-        
+
         if self.use_eqm:
             if eta is None:
                 eta = 1.0 / N
@@ -549,7 +552,9 @@ class CSPFlow(BaseModule):
             if self.pred_type:
                 m_t = torch.zeros_like(t_t)
 
-        last_step = N
+
+        last_step = N  
+
         for t in tqdm(range(1, N + 1)):
 
             t_stamp = t / N
@@ -582,7 +587,6 @@ class CSPFlow(BaseModule):
                 dec_f, dec_l, dec_lm, dec_t = f_t, l_t, lattices_mat_t, t_t
                 dec_uncond = False
 
-
             # ========= pred each step start =========
             if (guide_factor is not None) and (abs(guide_factor - 1) < 1e-4):  # no need to compute
                 pred_l = 0.0
@@ -592,13 +596,14 @@ class CSPFlow(BaseModule):
             else:
                 pred = self.decoder(
                     t=time_emb,
-                    atom_types=t_t,
-                    frac_coords=f_t,
-                    lattices_rep=l_t,
+                    atom_types=dec_t,
+                    frac_coords=dec_f,
+                    lattices_rep=dec_l,
                     num_atoms=batch.num_atoms,
                     node2graph=batch.batch,
-                    lattices_mat=lattices_mat_t,
-                    cemb=None, guide_indicator=None,uncond=dec_uncond,     
+                    lattices_mat=dec_lm,
+                    cemb=None, guide_indicator=None,
+                    uncond=dec_uncond,          # <-- ADD
                 )
                 pred = self.post_decoder_on_sample(
                     pred,
@@ -694,15 +699,15 @@ class CSPFlow(BaseModule):
 
         # stack final trajectory
         if self.pred_type:
-            stack_atom_types = torch.stack([traj[i]['atom_types'] for i in range(0, rng)])
+            stack_atom_types = torch.stack([traj[i]['atom_types'] for i in rng])
         else:
             stack_atom_types = batch.atom_types
 
         traj_stack = {
             'num_atoms': batch.num_atoms,
             'atom_types': stack_atom_types,
-            'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in range(0, rng)]),
-            'all_lattices': torch.stack([traj[i]['lattices'] for i in range(0, rng)]),
+            'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in rng]),
+            'all_lattices': torch.stack([traj[i]['lattices'] for i in rng]),
         }
 
         return traj[last_step], traj_stack
