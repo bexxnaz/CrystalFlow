@@ -86,6 +86,8 @@ def main(args):
     (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch) = diffusion(
         test_loader, model, num_evals=args.num_evals,
         step_lr=step_lr, N=args.ode_int_steps,
+        eta=args.eta, sampler=args.sampler, mu=args.mu,          # <-- ADD
+        grad_stop=args.grad_stop, min_steps=args.min_steps,      # <-- ADD, if these flags exist in this version of evaluate.py
         anneal_lattice=args.anneal_lattice, anneal_coords=args.anneal_coords, anneal_type=args.anneal_type, anneal_slope=args.anneal_slope, anneal_offset=args.anneal_offset,
         guide_factor=args.guide_factor,
     )
@@ -134,6 +136,12 @@ if __name__ == '__main__':
     eqm_group.add_argument('--eta', type=float, default=None, help="EqM step size, independent of N")
     eqm_group.add_argument('--sampler', choices=['gd','nag'], default='gd')
     eqm_group.add_argument('--mu', type=float, default=0.3)
+
+    step_group.add_argument('--grad-stop', dest='grad_stop', type=float, default=None,
+                         help="EqM adaptive early stop: field-norm threshold")
+    step_group.add_argument('--min-steps', dest='min_steps', type=int, default=1)
+
+
 
     args = parser.parse_args()
     main(args)
