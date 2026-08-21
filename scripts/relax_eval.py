@@ -69,7 +69,7 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
         batch_lattices = []
         for eval_idx in range(num_evals):
             print(f'batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}')
-            distorted = perturb_batch(batch, coord_noise, lattice_noise, device, model)   # <-- model added
+            distorted = perturb_batch(batch, coord_noise, lattice_noise, device, model)  
 
             if null_baseline:
                 out_frac = distorted['frac_coords'].detach().cpu()

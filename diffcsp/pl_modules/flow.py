@@ -143,7 +143,7 @@ class CSPFlow(BaseModule):
         self.use_symmetrize_loss = self.hparams.get("use_symmetrize_loss", False)
         self.cost_sym_lattice = self.hparams.get("cost_sym_lattice", self.hparams.cost_lattice)
         self.cost_sym_coord = self.hparams.get("cost_sym_coord", self.hparams.cost_coord)
-        self.use_eqm = self.hparams.get("use_eqm", True)
+        self.use_eqm = self.hparams.get("use_eqm", False)
         self.ct_a_coord     = self.hparams.get("ct_a_coord",   0.8)   # paper default
         self.ct_lam_coord   = self.hparams.get("ct_lam_coord", 4.0)
         self.ct_a_lattice   = self.hparams.get("ct_a_lattice", 0.8)   # start = coord; sweep down later
