@@ -35,6 +35,7 @@ def diffusion(loader, model, num_evals, **sample_kwargs):
         batch_all_frac_coords = []
         batch_all_lattices = []
         batch_frac_coords, batch_num_atoms, batch_atom_types = [], [], []
+        batch_n_steps_used, batch_final_coord_norm, batch_final_lattice_norm = [], [], []
         batch_lattices = []
         for eval_idx in range(num_evals):
 
@@ -44,11 +45,18 @@ def diffusion(loader, model, num_evals, **sample_kwargs):
             batch_num_atoms.append(outputs['num_atoms'].detach().cpu())
             batch_atom_types.append(outputs['atom_types'].detach().cpu())
             batch_lattices.append(outputs['lattices'].detach().cpu())
+            batch_n_steps_used.append(traj['n_steps_used'])
+            batch_final_coord_norm.append(traj['final_coord_field_norm'])
+            batch_final_lattice_norm.append(traj['final_lattice_field_norm'])
+
 
         frac_coords.append(torch.stack(batch_frac_coords, dim=0))
         num_atoms.append(torch.stack(batch_num_atoms, dim=0))
         atom_types.append(torch.stack(batch_atom_types, dim=0))
         lattices.append(torch.stack(batch_lattices, dim=0))
+        n_steps_used.append(torch.stack(batch_n_steps_used, dim=0))
+        final_coord_field_norm.append(torch.stack(batch_final_coord_norm, dim=0))
+        final_lattice_field_norm.append(torch.stack(batch_final_lattice_norm, dim=0))
 
         input_data_list = input_data_list + batch.to_data_list()
 
@@ -59,10 +67,14 @@ def diffusion(loader, model, num_evals, **sample_kwargs):
     lattices = torch.cat(lattices, dim=1)
     lengths, angles = lattices_to_params_shape(lattices)
     input_data_batch = Batch.from_data_list(input_data_list)
+    n_steps_used = torch.cat(n_steps_used, dim=1)                       
+    final_coord_field_norm = torch.cat(final_coord_field_norm, dim=1)   
+    final_lattice_field_norm = torch.cat(final_lattice_field_norm, dim=1)  
 
 
     return (
         frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch
+        ,n_steps_used, final_coord_field_norm, final_lattice_field_norm,
     )
 
 
@@ -83,7 +95,8 @@ def main(args):
     step_lr = args.step_lr if args.step_lr >= 0 else recommand_step_lr['csp' if args.num_evals == 1 else 'csp_multi'][args.dataset]
 
     start_time = time.time()
-    (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch) = diffusion(
+    frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch,
+     n_steps_used, final_coord_field_norm, final_lattice_field_norm = diffusion(
         test_loader, model, num_evals=args.num_evals,
         step_lr=step_lr, N=args.ode_int_steps,
         eta=args.eta, sampler=args.sampler, mu=args.mu,          # <-- ADD
@@ -107,6 +120,9 @@ def main(args):
         'lengths': lengths,
         'angles': angles,
         'time': time.time() - start_time,
+        'n_steps_used': n_steps_used,
+        'final_coord_field_norm': final_coord_field_norm, 
+        'final_lattice_field_norm': final_lattice_field_norm,  
     }, model_path / diff_out_name)
 
 

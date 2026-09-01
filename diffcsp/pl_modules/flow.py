@@ -446,6 +446,8 @@ class CSPFlow(BaseModule):
         eta=None, sampler="gd", mu=0.3,
         init_structure=None,
         grad_stop=None, 
+        grad_stop_coord=None,    
+        grad_stop_lattice=None,  
         min_steps=1,
         **kwargs,
     ):
@@ -680,7 +682,10 @@ class CSPFlow(BaseModule):
                 'lattices': lattices_mat_t,
             }
             # ========= build trajectory end =========
-            if self.use_eqm and grad_stop is not None and t >= min_steps:
+            gs_coord = grad_stop_coord if grad_stop_coord is not None else grad_stop
+            gs_lattice = grad_stop_lattice if grad_stop_lattice is not None else grad_stop
+
+            if self.use_eqm and (gs_coord is not None or gs_lattice is not None) and t >= min_steps:
                 if not self.keep_coords:
                     coord_field_norm = pred_f.norm(dim=-1).mean()
                 else:
@@ -691,11 +696,33 @@ class CSPFlow(BaseModule):
                 else:
                     lattice_field_norm = torch.tensor(0.0, device=self.device)
 
-                if (coord_field_norm < grad_stop) and (lattice_field_norm < grad_stop):
+                coord_ok = (gs_coord is None) or (coord_field_norm < gs_coord)
+                lattice_ok = (gs_lattice is None) or (lattice_field_norm < gs_lattice)
+
+                if coord_ok and lattice_ok:
                     last_step = t
                     break
 
         rng = range(0, last_step + 1)
+
+        # stack final trajectory
+        # >>> ADD: per-graph convergence diagnostics from the LAST computed field <
+        with torch.no_grad():
+            if not self.keep_coords:
+                per_atom_coord_norm = pred_f.norm(dim=-1)                          # [N_nodes]
+                final_coord_field_norm = scatter(
+                    per_atom_coord_norm, batch.batch, dim=0, reduce='mean'
+                )                                                                   # [B]
+            else:
+                final_coord_field_norm = torch.zeros(batch_size, device=self.device)
+
+            if not self.keep_lattice:
+                final_lattice_field_norm = pred_l.flatten(1).norm(dim=-1)          # [B], already per-graph
+            else:
+                final_lattice_field_norm = torch.zeros(batch_size, device=self.device)
+
+        n_steps_used = torch.full((batch_size,), last_step, device=self.device, dtype=torch.long)
+        # <<< END ADD
 
         # stack final trajectory
         if self.pred_type:
@@ -708,6 +735,11 @@ class CSPFlow(BaseModule):
             'atom_types': stack_atom_types,
             'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in rng]),
             'all_lattices': torch.stack([traj[i]['lattices'] for i in rng]),
+            # >>> ADD
+            'n_steps_used': n_steps_used.detach().cpu(),
+            'final_coord_field_norm': final_coord_field_norm.detach().cpu(),
+            'final_lattice_field_norm': final_lattice_field_norm.detach().cpu(),
+            # <<< END ADD
         }
 
         return traj[last_step], traj_stack

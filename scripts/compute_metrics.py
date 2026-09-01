@@ -17,11 +17,12 @@ from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core.composition import Composition
 from pymatgen.core.lattice import Lattice
 from pymatgen.core.structure import Structure
-from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pyxtal import pyxtal
 from scipy.stats import wasserstein_distance
 from tqdm import tqdm
 # from joblib import Parallel, delayed
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
 
 sys.path.append('.')
 
@@ -55,7 +56,7 @@ COV_Cutoffs = {
 
 class Crystal(object):
 
-    def __init__(self, crys_array_dict, compute_valid=True, compute_fp=False, ignore_smact=False):
+    def __init__(self, crys_array_dict, compute_valid=True, compute_fp=True, ignore_smact=False):
         self.frac_coords = crys_array_dict['frac_coords']
         self.atom_types = crys_array_dict['atom_types']
         self.lengths = crys_array_dict['lengths']
@@ -100,6 +101,8 @@ class Crystal(object):
             if self.structure.volume < 0.1:
                 self.constructed = False
                 self.invalid_reason = 'unrealistically_small_lattice'
+        if not hasattr(self, "constructed"):
+            raise ValueError("XXX")
 
     def get_composition(self):
         elem_counter = Counter(self.atom_types)
@@ -156,28 +159,52 @@ def _is_odd(structure: Structure):
     return False
 
 def _exact_composition_match(pred, gt):
-    """Exact stoichiometry match (not just reduced ratio) -- CSP is a
-    fixed-composition task, so pred and gt should have the IDENTICAL
-    multiset of atom types, not just the same reduced formula."""
+    """CSP is fixed-composition: pred and gt need the IDENTICAL atom
+    multiset, not just the same reduced formula."""
     return Counter(pred.atom_types.tolist()) == Counter(gt.atom_types.tolist())
 
 
-def get_rms_dist(pred: Crystal, gt, is_valid, matcher):
-    """
-    Returns {'rms_dist': float or None, 'category': str, 'detail': str}
-    instead of a bare rmsd/None, so a failure can be attributed to a specific
-    stage instead of collapsing into an undifferentiated None. `is_valid` is
-    kept in the signature (unused) only so the existing p_map(..., validity, ...)
-    call site doesn't need to change -- the checks below recompute pred/gt
-    validity at finer granularity than the single boolean it used to be.
-    """
+MAX_RMSD = 0.5
+def get_rms_dist(pred: Crystal, gt, is_valid, matcher, assess_all=False, norm=True):
+
+    def av_lat(l1: Lattice, l2: Lattice):
+        params = (np.array(l1.parameters) + np.array(l2.parameters)) / 2
+        return Lattice.from_parameters(*params)
+
+    if not pred.constructed:
+        rms_dist = None
+    elif _is_odd(pred.structure):
+        rms_dist = None
+    if not is_valid:
+        rms_dist = None
+
+    try:
+        rms_dist = matcher.get_rms_dist(pred.structure, gt.structure)
+        rms_dist = rms_dist[0]
+    except Exception:
+        rms_dist = None
+
+    if (rms_dist is None) and assess_all:
+        rms_dist = MAX_RMSD
+
+    if norm:
+        return rms_dist
+    else:
+        avg_l = av_lat(pred.structure.lattice, gt.structure.lattice)
+        normalization = (len(pred.structure) / avg_l.volume) ** (1 / 3)
+        return rms_dist / normalization
+
+
+def get_rms_dist_wbm(pred: Crystal, gt, matcher, assess_all=False):
+    """Categorized match result: {'rms_dist', 'category', 'detail'}, so a
+    failure is attributed to a specific stage rather than collapsing to
+    an undifferentiated None."""
     if not pred.constructed:
         return {'rms_dist': None, 'category': 'pred_not_constructed',
                 'detail': getattr(pred, 'invalid_reason', 'unknown')}
 
     if _is_odd(pred.structure):
-        lengths = pred.structure.lattice.abc
-        angles = pred.structure.lattice.angles
+        lengths, angles = pred.structure.lattice.abc, pred.structure.lattice.angles
         return {'rms_dist': None, 'category': 'pred_odd_geometry',
                 'detail': f'lengths={tuple(round(x, 2) for x in lengths)} '
                           f'angles={tuple(round(x, 1) for x in angles)}'}
@@ -205,289 +232,154 @@ def get_rms_dist(pred: Crystal, gt, is_valid, matcher):
     try:
         result = matcher.get_rms_dist(pred.structure, gt.structure)
     except Exception as e:
-        return {'rms_dist': None, 'category': 'geometry_too_different',
-                'detail': f'matcher exception: {e}'}
+        return {'rms_dist': None, 'category': 'geometry_too_different', 'detail': f'matcher exception: {e}'}
 
-    if result is None:
-        return {'rms_dist': None, 'category': 'geometry_too_different', 'detail': ''}
-
-    return {'rms_dist': result[0], 'category': 'matched', 'detail': ''}
-
-
-# Module-level matcher, built once -- NOT per-call, since StructureMatcher
-# construction has nontrivial overhead and this runs over the full test set.
-# stol=1.0, scale=False matches pred_vs_ref_struct_symmetry() in
-# matbench_discovery/metrics/geo_opt.py (ltol=0.2, angle_tol=5 stay at
-# pymatgen defaults -- MBD only overrides stol and scale).
-_MBD_MATCHER = StructureMatcher(stol=1.0, scale=False)
+    rms_dist = None if result is None else result[0]
+    if rms_dist is None and assess_all:
+        rms_dist = MAX_RMSD
+    category = 'matched' if rms_dist is not None else 'geometry_too_different'
+    return {'rms_dist': rms_dist, 'category': category, 'detail': ''}
 
 
-def get_rms_dist_mbd(pred: Crystal, gt: Crystal):
-    """Per-structure RMSD under the Matbench Discovery protocol.
-
-    Mirrors pred_vs_ref_struct_symmetry()'s per-material computation:
-    returns raw rmsd on success, None on any failure (unconstructed
-    prediction, matcher returning no fit, or an exception). No fill-value
-    substitution happens here -- that's a separate aggregation-time step,
-    done in RecEvalMBD.get_metrics() to mirror calc_geo_opt_metrics().
-    """
-    if not pred.constructed:
-        return None
-    try:
-        result = _MBD_MATCHER.get_rms_dist(pred.structure, gt.structure)
-    except Exception:
-        result = None
-    if result is None:
-        return None
-    rmsd, max_dist = result
-    return rmsd
 
 
-class RecEvalMBD(object):
-    """Matbench Discovery-faithful RMSD evaluator.
-
-    Two-stage, matching their actual code split across two functions:
-      1. get_rms_dist_mbd()   -- per-structure RMSD, NaN on failure
-                                  (mirrors pred_vs_ref_struct_symmetry)
-      2. get_metrics() below  -- fillna(1.0).mean() aggregation
-                                  (mirrors calc_geo_opt_metrics)
-    """
-
-    def __init__(self, pred_crys, gt_crys, njobs=1):
-        assert len(pred_crys) == len(gt_crys)
-        self.preds = pred_crys
-        self.gts = gt_crys
-        self.njobs = njobs
-
-    def get_metrics(self):
-        if self.njobs > 1:
-            raw = p_map(get_rms_dist_mbd, self.preds, self.gts,
-                        num_cpus=self.njobs, ncols=79)
-        else:
-            raw = [get_rms_dist_mbd(p, g) for p, g in zip(self.preds, self.gts)]
-
-        self.raw_rmsds = raw  # keep around for inspection, mirrors self.rms_dists in RecEval
-
-        raw_series = pd.Series(raw, dtype=float)  # None -> NaN automatically
-
-        mean_rmsd = raw_series.fillna(1.0).mean()      # THE leaderboard-comparable number
-        median_rmsd = raw_series.fillna(1.0).median()
-        n_matched = int(raw_series.notna().sum())
-
-        return {
-            'mbd_rmsd_mean': float(mean_rmsd),
-            'mbd_rmsd_median': float(median_rmsd),
-            'raw_match_rate': n_matched / len(raw_series),
-            'raw_rmsd_matched_only_mean': float(raw_series.mean()),  # for your own transparency, not for direct leaderboard comparison
-            'n_structures': len(raw_series),
-        }
-
-# ---------------------------------------------------------------------------
-# Geometry-optimization evaluation: mirrors matbench-discovery's own
-# two-stage split (matbench_discovery/structure/symmetry.py):
-#   1. get_sym_info_from_structs()   -- symmetry computed ONCE per structure
-#   2. pred_vs_ref_struct_symmetry() -- diffs + RMSD, matched by material_id
-# then calc_geo_opt_metrics() (matbench_discovery/metrics/geo_opt.py) is
-# imported and called directly for aggregation -- their exact code, not a
-# reimplementation.
-#
-# NOTE on matching: the official pipeline matches pred/gt by material_id
-# (set intersection of two structure dicts) and raises on duplicate/missing
-# IDs. This repo's Crystal objects don't currently carry a material_id, so
-# the code below matches pred_crys[i] to gt_crys[i] BY POSITION instead --
-# only correct if crys_array_list and your gt_file/true_crystal_array_list
-# were built in the same order. If you want the official ID-based matching
-# (safer against silent misalignment), thread material_id through
-# get_gt_crys_ori()/Crystal and switch the zip() below to dict lookups on
-# shared IDs.
-# ---------------------------------------------------------------------------
- 
 def get_sym_info_moyopy(structure: Structure, symprec: float, angle_tolerance=None):
-    """Space group number and symmetry-operation count via moyopy, matching
-    matbench_discovery/structure/symmetry.py::get_sym_info_from_structs()
-    exactly: MoyoAdapter.from_py_obj() (NOT from_structure -- that method
-    doesn't exist), and sym_data.operations.num_operations (NOT
-    len(operations) -- operations is an object with this attribute, not a
-    plain sequence). This is the default, faithful path."""
+    """Faithful default: matches matbench_discovery's get_sym_info_from_structs()
+    exactly -- MoyoAdapter.from_py_obj() and sym_data.operations.num_operations."""
     try:
         import moyopy
         from moyopy.interface import MoyoAdapter
         moyo_cell = MoyoAdapter.from_py_obj(structure)
-        sym_data = moyopy.MoyoDataset(
-            moyo_cell, symprec=symprec, angle_tolerance=angle_tolerance
-        )
+        sym_data = moyopy.MoyoDataset(moyo_cell, symprec=symprec, angle_tolerance=angle_tolerance)
         return sym_data.number, sym_data.operations.num_operations
     except Exception:
         return None, None
- 
- 
+
+
 def get_sym_info_pymatgen(structure: Structure, symprec: float):
-    """Fallback/cross-check path via pymatgen's SpacegroupAnalyzer (spglib).
-    NOT what the official leaderboard uses -- get_sym_info_moyopy above is
-    the faithful default. Useful only to sanity-check moyopy results
-    against a second, independently-verified implementation."""
+    """Cross-check path only -- NOT what the official leaderboard uses."""
     try:
         sga = SpacegroupAnalyzer(structure, symprec=symprec)
         return sga.get_space_group_number(), len(sga.get_symmetry_operations())
     except Exception:
         return None, None
- 
- 
-def _precompute_sym_info(crys_list, symprec, use_moyopy=True, njobs=1):
-    """Stage 1: symmetry info computed ONCE per structure, mirroring
-    get_sym_info_from_structs(). Returns a list of (spg_num, n_sym_ops)
-    tuples, same length/order as crys_list; (None, None) for unconstructed
-    or symmetry-finder-failed structures. Computing this once per unique
-    structure (rather than once per pred/gt PAIR) avoids redundant moyopy
-    calls -- important at WBM scale where recomputation adds up fast."""
+
+_MBD_MATCHER =StructureMatcher(stol=0.5, angle_tol=10, ltol=0.3, scale=True)
+
+def get_geo_opt_row(pred: Crystal, gt: Crystal, symprec, use_moyopy,
+                     material_id=None, convergence=None):
+    """One row: symmetry diff + RMSD (matbench-discovery protocol), the
+    categorized CDVAE-style match diagnostic, plus composition/volume
+    diagnostics and (if given) sampler convergence info."""
     sym_fn = get_sym_info_moyopy if use_moyopy else get_sym_info_pymatgen
- 
-    def _one(crys):
-        if not getattr(crys, 'constructed', False):
-            return (None, None)
-        return sym_fn(crys.structure, symprec)
- 
-    if njobs > 1:
-        return p_map(_one, crys_list, num_cpus=njobs, ncols=79)
-    return [_one(c) for c in crys_list]
- 
- 
-def get_geo_opt_row(pred: Crystal, gt: Crystal, pred_sym, gt_sym):
-    """Stage 2: diff + RMSD for one pred/gt pair, mirroring
-    pred_vs_ref_struct_symmetry(). pred_sym / gt_sym are the PRECOMPUTED
-    (spg_num, n_sym_ops) tuples from _precompute_sym_info() -- symmetry is
-    NOT recomputed here."""
+    pred_spg, pred_nops = sym_fn(pred.structure, symprec) if pred.constructed else (None, None)
+    gt_spg, gt_nops = sym_fn(gt.structure, symprec) if gt.constructed else (None, None)
+
+
+    match_res = get_rms_dist_wbm(pred, gt, _MBD_MATCHER)
+
     row = {
+        'material_id': material_id,
+        'elements': ','.join(sorted(set(str(e) for e in pred.atom_types))),   
+        'pred_constructed': pred.constructed,
+        'pred_comp_valid': pred.comp_valid,     
+        'pred_struct_valid': pred.struct_valid,
+        'category': match_res['category'],      
+        'rmsd': match_res['rms_dist'],         
+        'detail': match_res['detail'],           
+        'reduced_formula': pred.structure.composition.reduced_formula if pred.constructed else None,
+        'n_sites': len(pred.atom_types),
+        'n_elements': len(pred.elems),
         'structure_rmsd_vs_dft': np.nan,
-        'n_sym_ops_diff': np.nan,
-        'spg_num_diff': np.nan,
         'max_pair_dist': np.nan,
+        'spg_num_diff': (pred_spg - gt_spg) if (pred_spg is not None and gt_spg is not None) else np.nan,
+        'n_sym_ops_diff': (pred_nops - gt_nops) if (pred_nops is not None and gt_nops is not None) else np.nan,
     }
- 
-    pred_spg, pred_nops = pred_sym
-    gt_spg, gt_nops = gt_sym
-    if pred_spg is not None and gt_spg is not None:
-        row['spg_num_diff'] = pred_spg - gt_spg
-    if pred_nops is not None and gt_nops is not None:
-        row['n_sym_ops_diff'] = pred_nops - gt_nops
- 
-    if not pred.constructed:
-        return row
- 
-    try:
-        # order matches pred_vs_ref_struct_symmetry(): pred first, then ref/gt
-        result = _MBD_MATCHER.get_rms_dist(pred.structure, gt.structure)
-    except Exception:
-        result = None
-    if result is not None:
-        rmsd, max_dist = result
-        row['structure_rmsd_vs_dft'] = rmsd
-        row['max_pair_dist'] = max_dist
- 
+
+    if pred.constructed:
+        dist_mat = pred.structure.distance_matrix
+        np.fill_diagonal(dist_mat, np.inf)
+        row['min_interatomic_dist'] = float(dist_mat.min())
+        row['pred_volume_per_atom'] = pred.structure.volume / len(pred.structure)
+        try:
+            result = _MBD_MATCHER.get_rms_dist(pred.structure, gt.structure)   # <-- FIXED: was get_rms_dist_wbm
+        except Exception:
+            result = None
+        if result is not None:
+            row['structure_rmsd_vs_dft'], row['max_pair_dist'] = result
+    else:
+        row['min_interatomic_dist'] = None
+        row['pred_volume_per_atom'] = None
+
+    row['gt_volume_per_atom'] = gt.structure.volume / len(gt.structure) if gt.constructed else None
+
+    if convergence is not None:
+        row.update(convergence)
+
     return row
- 
- 
-def _calc_geo_opt_metrics_vendored(df_model_analysis: pd.DataFrame) -> dict:
-    """Vendored copy of matbench_discovery.metrics.geo_opt.calc_geo_opt_metrics(),
-    logic verified verbatim against the actual upstream source. Reimplemented
-    locally because the matbench-discovery package now requires Python
-    >=3.14, incompatible with this project's Python 3.11 environment.
- 
-    Uses plain string column/key names instead of the pymatviz.Key /
-    matbench_discovery.enums.MbdKey enums -- since this function both
-    consumes and produces those names itself (GeoOptEvalMBD builds the
-    input DataFrame with exactly these column names), internal consistency
-    is all that's required; the arithmetic below is copied unchanged from
-    the real source, which is the part that actually needs to match
-    upstream."""
-    spg_diff = df_model_analysis['spg_num_diff']
-    n_sym_ops_diff = df_model_analysis['n_sym_ops_diff']
-    rmsd_vals = df_model_analysis['structure_rmsd_vs_dft']
- 
-    valid_sym_mask = spg_diff.notna()
-    n_valid_sym = valid_sym_mask.sum()
- 
-    mean_rmsd = pd.to_numeric(rmsd_vals, errors='coerce').fillna(1.0).mean()
- 
-    sym_ops_mae = n_sym_ops_diff[valid_sym_mask].abs().mean()
- 
-    changed_mask = (spg_diff != 0) & valid_sym_mask
-    sym_decreased = (n_sym_ops_diff < 0) & changed_mask
-    sym_increased = (n_sym_ops_diff > 0) & changed_mask
-    sym_matched = ~changed_mask & valid_sym_mask
- 
-    return {
-        'structure_rmsd_vs_dft': float(mean_rmsd),
-        'n_sym_ops_mae': float(sym_ops_mae),
-        'symmetry_decrease': float(sym_decreased.sum() / n_valid_sym) if n_valid_sym > 0 else float('nan'),
-        'symmetry_match': float(sym_matched.sum() / n_valid_sym) if n_valid_sym > 0 else float('nan'),
-        'symmetry_increase': float(sym_increased.sum() / n_valid_sym) if n_valid_sym > 0 else float('nan'),
-        'n_structures': int(n_valid_sym),
-    }
- 
- 
+
+
 class GeoOptEvalMBD(object):
-    """Matbench Discovery-faithful geometry-optimization evaluator.
- 
-    Two-stage, matching the real symmetry.py split:
-      1. _precompute_sym_info() on preds and on gts SEPARATELY (each
-         structure's symmetry computed exactly once)
-      2. get_geo_opt_row() diffs the precomputed results + RMSD, per pair
- 
-    then aggregates via matbench_discovery's REAL calc_geo_opt_metrics().
-    """
- 
-    def __init__(self, pred_crys, gt_crys, njobs=1, symprec=1e-2, use_moyopy=True):
+    """Matbench Discovery-faithful geometry-optimization evaluator, same
+    shape as RecEval: build one row per structure, aggregate, done. Keeps
+    self.df (the per-structure table) for failure inspection -- no separate
+    failure_analysis task needed, just look at self.df / the saved CSV."""
+
+    def __init__(self, pred_crys, gt_crys, njobs=1, symprec=1e-2, use_moyopy=True,
+                 material_ids=None, convergence_info=None):
         assert len(pred_crys) == len(gt_crys)
         self.preds = pred_crys
         self.gts = gt_crys
         self.njobs = njobs
         self.symprec = symprec
         self.use_moyopy = use_moyopy
- 
+        self.material_ids = material_ids
+        self.convergence_info = convergence_info
+
     def get_metrics(self):
-        pred_sym = _precompute_sym_info(self.preds, self.symprec, self.use_moyopy, self.njobs)
-        gt_sym = _precompute_sym_info(self.gts, self.symprec, self.use_moyopy, self.njobs)
- 
-        rows = [
-            get_geo_opt_row(p, g, ps, gs)
-            for p, g, ps, gs in zip(self.preds, self.gts, pred_sym, gt_sym)
+        n = len(self.preds)
+        conv_rows = None
+        if self.convergence_info is not None:
+            for key in self.convergence_info:
+                if len(self.convergence_info[key]) != n:
+                    raise ValueError(f"convergence_info['{key}'] length {len(self.convergence_info[key])} "
+                                      f"!= {n}; squeeze the num_evals axis before passing it in.")
+            conv_rows = [{k: v[i] for k, v in self.convergence_info.items()} for i in range(n)]
+
+        call_args = [
+            (self.preds[i], self.gts[i], self.symprec, self.use_moyopy,
+             self.material_ids[i] if self.material_ids else None,
+             conv_rows[i] if conv_rows else None)
+            for i in range(n)
         ]
-        self.df_model_analysis = pd.DataFrame(rows)  # kept for inspection / CSV dump
- 
-        try:
-            from matbench_discovery.metrics.geo_opt import calc_geo_opt_metrics
-            self.used_vendored_metrics_fn = False
-        except Exception:
-            # Broad except deliberately: matbench-discovery's internals have
-            # been seen to fail in ways beyond a plain ImportError (e.g. a
-            # SyntaxError inside a transitively-imported submodule from a
-            # corrupted/mismatched install). Any failure to import the real
-            # function should fall back to the verified vendored copy rather
-            # than crash the whole evaluation.
-            calc_geo_opt_metrics = _calc_geo_opt_metrics_vendored
-            self.used_vendored_metrics_fn = True
-        mbd_metrics = calc_geo_opt_metrics(self.df_model_analysis)
-        # mbd_metrics's own "n_structures"-type key means count of structures
-        # with VALID SYMMETRY data (their docstring: "total number of
-        # structures is counted based on valid symmetry data") -- NOT total
-        # submitted and NOT count with valid RMSD. Don't confuse it with
-        # n_structures_submitted below; that bug (silently overwriting their
-        # real key with a different definition) is exactly what this
-        # rewrite fixes.
- 
-        n_submitted = len(self.df_model_analysis)
-        n_rmsd_valid = int(self.df_model_analysis['structure_rmsd_vs_dft'].notna().sum())
- 
+        rows = p_map(lambda a: get_geo_opt_row(*a), call_args, num_cpus=self.njobs, ncols=79)
+        self.df = pd.DataFrame(rows)
+
+        rmsd_vals = pd.to_numeric(self.df['structure_rmsd_vs_dft'], errors='coerce')
+        valid_sym_mask = self.df['spg_num_diff'].notna()
+        n_valid_sym = int(valid_sym_mask.sum())
+        changed_mask = (self.df['spg_num_diff'] != 0) & valid_sym_mask
+        sym_decreased = (self.df['n_sym_ops_diff'] < 0) & changed_mask
+        sym_increased = (self.df['n_sym_ops_diff'] > 0) & changed_mask
+        sym_matched = ~changed_mask & valid_sym_mask
+        match_rate = float((self.df['category'] == 'matched').mean())
+        n_rmsd_valid = int(rmsd_vals.notna().sum())
+        matched_only_mean = float(rmsd_vals.dropna().mean()) if n_rmsd_valid else float('nan')
+
         return {
-            **mbd_metrics,
-            'n_structures_submitted': n_submitted,
-            'n_rmsd_valid': n_rmsd_valid,
-            'used_vendored_metrics_fn': self.used_vendored_metrics_fn,
+            'structure_rmsd_vs_dft': float(rmsd_vals.fillna(1.0).mean()),
+            'structure_rmsd_vs_dft_matched_only': matched_only_mean,
+            'match_rate': match_rate, 
+            'n_sym_ops_mae': float(self.df['n_sym_ops_diff'][valid_sym_mask].abs().mean()) if n_valid_sym else float('nan'),
+            'symmetry_decrease': float(sym_decreased.sum() / n_valid_sym) if n_valid_sym else float('nan'),
+            'symmetry_match': float(sym_matched.sum() / n_valid_sym) if n_valid_sym else float('nan'),
+            'symmetry_increase': float(sym_increased.sum() / n_valid_sym) if n_valid_sym else float('nan'),
+            'n_structures_valid_sym': n_valid_sym,
+            'n_structures_submitted': n,
+            'n_rmsd_valid': int(rmsd_vals.notna().sum()),
         }
 
 class RecEval(object):
-
     def __init__(self, pred_crys, gt_crys, stol=0.5, angle_tol=10, ltol=0.3, njobs=1):
         assert len(pred_crys) == len(gt_crys)
         self.matcher = StructureMatcher(
@@ -499,7 +391,7 @@ class RecEval(object):
     def get_match_rate_and_rms(self):
         validity = [c1.valid and c2.valid for c1, c2 in zip(self.preds, self.gts)]
 
-        results = p_map(
+        rms_dists = p_map(
             partial(get_rms_dist, matcher=self.matcher),
             self.preds,
             self.gts,
@@ -507,25 +399,18 @@ class RecEval(object):
             num_cpus=self.njobs,
             ncols=79,
         )
-        self.results = results
+        self.rms_dists = rms_dists
 
-        rms_dists = np.array([r['rms_dist'] for r in results])
-        categories = [r['category'] for r in results]
-        self.categories = categories
+        # rms_dists = []
+        # for i in tqdm(range(len(self.preds)), ncols=79):
+        #     rms_dists.append(process_one(
+        #         self.preds[i], self.gts[i], validity[i]))
+        rms_dists = np.array(rms_dists)
 
         match_rate = sum(rms_dists != None) / len(self.preds)
-        matched_mask = rms_dists != None
-        mean_rms_dist = rms_dists[matched_mask].mean() if matched_mask.any() else float('nan')
-
-        category_counts = dict(Counter(categories))
-        category_pcts = {k: v / len(self.preds) for k, v in category_counts.items()}
-
-        return {
-            'match_rate': match_rate,
-            'rms_dist': mean_rms_dist,
-            'category_counts': category_counts,
-            'category_pcts': category_pcts,
-        }
+        mean_rms_dist = rms_dists[rms_dists != None].mean()
+        return {'match_rate': match_rate,
+                'rms_dist': mean_rms_dist}     
 
     def get_metrics(self):
         metrics = {}
@@ -544,15 +429,16 @@ class RecEvalBatch(object):
 
     def get_match_rate_and_rms(self):
         def process_one(pred, gt, is_valid):
-            if not is_valid:
-                return None
-            try:
-                rms_dist = self.matcher.get_rms_dist(
-                    pred.structure, gt.structure)
-                rms_dist = None if rms_dist is None else rms_dist[0]
-                return rms_dist
-            except Exception:
-                return None
+            return get_rms_dist(pred, gt, is_valid, self.matcher)
+            # if not is_valid:
+            #     return None
+            # try:
+            #     rms_dist = self.matcher.get_rms_dist(
+            #         pred.structure, gt.structure)
+            #     rms_dist = None if rms_dist is None else rms_dist[0]
+            #     return rms_dist
+            # except Exception:
+            #     return None
 
         rms_dists = []
         self.all_rms_dis = np.zeros((self.batch_size, len(self.gts)))
@@ -717,7 +603,7 @@ def get_crystal_array_list(file_path, batch_idx=0):
             data['atom_types'],
             data['lengths'],
             data['angles'],
-            data['num_atoms'])
+            data['num_atoms'])        
     else:
         crys_array_list = get_crystals_list(
             data['frac_coords'][batch_idx],
@@ -742,7 +628,7 @@ def get_crystal_array_list(file_path, batch_idx=0):
     return crys_array_list, true_crystal_array_list
 
 
-def get_gt_crys_ori(cif):
+def get_gt_crys_ori(cif, compute_valid=True, compute_fp=True):
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         structure = Structure.from_str(cif,fmt='cif')
@@ -753,7 +639,8 @@ def get_gt_crys_ori(cif):
         'lengths': np.array(lattice.abc),
         'angles': np.array(lattice.angles)
     }
-    return Crystal(crys_array_dict)
+    return Crystal(crys_array_dict, compute_valid=compute_valid, compute_fp=compute_fp)
+
 
 def main(args):
     all_metrics = {}
@@ -788,44 +675,45 @@ def main(args):
         gen_metrics = gen_evaluator.get_metrics()
         all_metrics.update(gen_metrics)
 
-    elif 'csp_mbd' in args.tasks:
-        recon_file_path = get_file_paths(args.root_path, 'diff', args.label)
-        crys_array_list, true_crystal_array_list = get_crystal_array_list(recon_file_path, batch_idx=0)
-        if args.gt_file != '':
-            csv = pd.read_csv(args.gt_file)
-            gt_crys = p_map(get_gt_crys_ori, csv['cif'])
-        else:
-            gt_crys = p_map(lambda x: Crystal(x), true_crystal_array_list, num_cpus=args.njobs)
-        pred_crys = p_map(lambda x: Crystal(x), crys_array_list, num_cpus=args.njobs)
-
-        rec_evaluator = RecEvalMBD(pred_crys, gt_crys, njobs=args.njobs)
-        all_metrics.update(rec_evaluator.get_metrics())
-
     elif 'geo_opt_mbd' in args.tasks:
         recon_file_path = get_file_paths(args.root_path, 'diff', args.label)
-        crys_array_list, true_crystal_array_list = get_crystal_array_list(recon_file_path, batch_idx=0)
+        raw_pt_data = load_data(recon_file_path)
+        crys_array_list, true_crystal_array_list = get_crystal_array_list(
+            recon_file_path, batch_idx = 0)
+        
+        material_ids = None
         if args.gt_file != '':
             csv = pd.read_csv(args.gt_file)
-            gt_crys = p_map(get_gt_crys_ori, csv['cif'])
+            gt_crys = p_map(partial(get_gt_crys_ori, compute_valid=True, compute_fp=False), csv['cif'])
+            if 'material_id' in csv.columns:
+                material_ids = csv['material_id'].tolist()
         else:
-            gt_crys = p_map(lambda x: Crystal(x), true_crystal_array_list, num_cpus=args.njobs)
-        pred_crys = p_map(lambda x: Crystal(x), crys_array_list, num_cpus=args.njobs)
+            gt_crys = p_map(lambda x: Crystal(x, compute_valid=True, compute_fp=False), true_crystal_array_list, num_cpus=args.njobs)
 
-        geo_opt_evaluator = GeoOptEvalMBD(
-            pred_crys, gt_crys, njobs=args.njobs,
-            symprec=args.symprec, use_moyopy=not args.use_pymatgen_symmetry,
-        )
-        all_metrics.update(geo_opt_evaluator.get_metrics())
+       
+        pred_crys = p_map(lambda x: Crystal(x, compute_valid=True, compute_fp=False), crys_array_list, num_cpus=args.njobs)
 
-        # dump the raw per-structure DataFrame alongside the aggregated metrics,
-        # so you can inspect exactly which rows are NaN and why before trusting
-        # the aggregated numbers at WBM scale.
-        analysis_out_name = 'geo_opt_analysis.csv' if args.label == '' else f'geo_opt_analysis_{args.label}.csv'
-        geo_opt_evaluator.df_model_analysis.to_csv(
-            os.path.join(args.root_path, analysis_out_name), index=False
-        )
-        print(f'Saved per-structure geo-opt analysis to {analysis_out_name}')
 
+        convergence_info = None
+        if 'n_steps_used' in raw_pt_data:
+            convergence_info = {
+                'n_steps_used': raw_pt_data['n_steps_used'][0].numpy(),
+                'final_coord_field_norm': raw_pt_data['final_coord_field_norm'][0].numpy(),
+                'final_lattice_field_norm': raw_pt_data['final_lattice_field_norm'][0].numpy(),
+            }
+
+        evaluator = GeoOptEvalMBD(pred_crys, gt_crys, njobs=args.njobs,
+                                   symprec=args.symprec, use_moyopy=not args.use_pymatgen_symmetry,
+                                   material_ids=material_ids, convergence_info=convergence_info)
+        all_metrics.update(evaluator.get_metrics())
+
+        analysis_out_name = 'geo_opt_analysis.csv' if not args.label else f'geo_opt_analysis_{args.label}.csv'
+        evaluator.df.to_csv(os.path.join(args.root_path, analysis_out_name), index=False)
+        print(f'Saved per-structure analysis to {analysis_out_name}')
+        print('\nmatch rate by n_elements:')
+        print(evaluator.df.groupby('n_elements')['structure_rmsd_vs_dft'].apply(lambda s: s.notna().mean()))
+
+    
     else:
 
         recon_file_path = get_file_paths(args.root_path, 'diff', args.label)
@@ -850,6 +738,7 @@ def main(args):
 
         if args.multi_eval:
             rec_evaluator = RecEvalBatch(pred_crys, gt_crys)
+            # rec_evaluator = RecEvalBatch(pred_crys, gt_crys, stol=0.3, angle_tol=5, ltol=0.2)
         else:
             rec_evaluator = RecEval(pred_crys, gt_crys)
 
@@ -897,15 +786,13 @@ if __name__ == '__main__':
     parser.add_argument('--gt_file',default='')
     parser.add_argument('--multi_eval',action='store_true')
     parser.add_argument('--multi_idx', type=int, default=None, help="index for multi_eval (special case)")
-    parser.add_argument('-j', '--njobs', default=8, type=int)
+    parser.add_argument('-j', '--njobs', default=32, type=int)
     parser.add_argument('--symprec', type=float, default=1e-2,
-                         help="symmetry-finder tolerance for geo_opt_mbd task "
+                         help="symmetry-finder tolerance for geo_opt_mbd/failure_analysis "
                               "(matbench-discovery reports both 1e-2 and 1e-5)")
     parser.add_argument('--use_pymatgen_symmetry', action='store_true',
-                         help="use pymatgen/spglib instead of moyopy for the geo_opt_mbd "
-                              "symmetry pass. moyopy (the default) is what the official "
-                              "matbench-discovery leaderboard actually uses; this flag is "
-                              "only for cross-checking moyopy results against an "
-                              "independent implementation, not for matching official numbers.")
+                         help="use pymatgen/spglib instead of moyopy for the symmetry pass. "
+                              "moyopy (the default) is what the official leaderboard uses; "
+                              "this flag is only for cross-checking, not for matching official numbers.")
     args = parser.parse_args()
     main(args)

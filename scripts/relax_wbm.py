@@ -31,6 +31,54 @@ from diffcsp.common.data_utils import (
     min_distance_sqr_pbc,
 )
 
+import pandas as pd  # add if not already imported
+
+
+def get_material_ids_for_loader(loader, csv_path):
+    """Read the material_id column from the CSV the dataset was actually
+    built from, in the SAME order CrystDataset iterates it. A length check
+    guards against silent misalignment if preprocessing dropped/reordered
+    rows. If loader.dataset is a torch.utils.data.Subset (from
+    subsample_loader), the same subsetting is applied to material_ids so
+    the two stay in lockstep."""
+    df = pd.read_csv(csv_path)
+    if 'material_id' not in df.columns:
+        print(f'WARNING: no material_id column in {csv_path} -- saving without it.')
+        return None
+    material_ids = df['material_id'].tolist()
+
+    dataset = loader.dataset
+    if isinstance(dataset, torch.utils.data.Subset):
+        base_len = len(dataset.dataset)
+        if len(material_ids) != base_len:
+            raise ValueError(
+                f"material_id count ({len(material_ids)}) != underlying dataset "
+                f"length ({base_len}) -- CrystDataset preprocessing may have "
+                f"dropped/reordered rows; cannot safely align material_id.")
+        material_ids = [material_ids[i] for i in dataset.indices]
+    else:
+        if len(material_ids) != len(dataset):
+            raise ValueError(
+                f"material_id count ({len(material_ids)}) != dataset length "
+                f"({len(dataset)}) -- cannot safely align material_id.")
+    return material_ids
+
+
+def subsample_loader(loader, n, seed=0):
+    """Return a new loader over a random subset of n structures from the
+    same underlying dataset, same batch_size/collate behavior. Use this to
+    iterate quickly (e.g. testing --symmetrize, tuning grad_stop) before
+    committing to a full-dataset run."""
+    dataset = loader.dataset
+    total = len(dataset)
+    n = min(n, total)
+    rng = np.random.default_rng(seed)
+    indices = sorted(rng.choice(total, size=n, replace=False).tolist())
+    subset = torch.utils.data.Subset(dataset, indices)
+    new_loader = type(loader)(subset, batch_size=loader.batch_size)
+    print(f'Subsampled test set: {n} / {total} structures (seed={seed})')
+    return new_loader
+
 def perturb_batch(batch, coord_noise, lattice_noise, device, model):
     frac_coords = batch.frac_coords.clone().to(device)
     frac_coords_distorted = (frac_coords + torch.randn_like(frac_coords) * coord_noise) % 1.0
@@ -54,11 +102,80 @@ def perturb_batch(batch, coord_noise, lattice_noise, device, model):
 
 
 
-def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=False, **sample_kwargs):
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+
+def symmetrize_batch(frac_coords, lattices_mat, atom_types, num_atoms, symprec=0.1):
+    """Post-hoc symmetrization of a batched sampler output. Splits the batch
+    into individual pymatgen Structures via num_atoms, symmetrizes each,
+    and reassembles into padded tensors. Falls back to the original
+    structure on any symmetrization failure (never drops a structure).
+
+    IMPORTANT: symmetrization can reorder atoms within a structure, so
+    atom_types is re-derived from each symmetrized structure's own species
+    list -- do not assume the original atom_types tensor still lines up.
+    """
+    frac_coords = frac_coords.detach().cpu().numpy()
+    lattices_mat = lattices_mat.detach().cpu().numpy()
+    atom_types = atom_types.detach().cpu().numpy()
+    num_atoms_list = num_atoms.detach().cpu().numpy().tolist()
+    n_still_p1 = 0
+    n_exception = 0
+    n_changed = 0
+
+    out_frac, out_lattices, out_atom_types = [], [], []
+    offset = 0
+    for i, n in enumerate(num_atoms_list):
+        fc = frac_coords[offset:offset + n]
+        at = atom_types[offset:offset + n]
+        lat = lattices_mat[i]
+        offset += n
+
+        try:
+            struct = Structure(
+                lattice=Lattice(lat), species=at, coords=fc, coords_are_cartesian=False
+            )
+            sga = SpacegroupAnalyzer(struct, symprec=symprec)
+            sym_struct = sga.get_symmetrized_structure()
+            spg_num = sga.get_space_group_number()
+            if spg_num == 1:
+                n_still_p1 += 1
+            else:
+                n_changed += 1
+
+            if len(sym_struct) != n:
+                raise ValueError("symmetrization changed atom count")  # safety guard, keep original
+
+            out_frac.append(sym_struct.frac_coords)
+            out_lattices.append(sym_struct.lattice.matrix)
+            out_atom_types.append(np.array([s.specie.Z for s in sym_struct]))
+        except Exception:
+            n_exception += 1
+            out_frac.append(fc)
+            out_lattices.append(lat)
+            out_atom_types.append(at)
+    
+
+    total = len(num_atoms_list)
+    print(f'symmetrize_batch: {n_changed}/{total} found real symmetry, '
+            f'{n_still_p1}/{total} still P1 at symprec={symprec}, '
+            f'{n_exception}/{total} exceptions (fell back to original)')
+
+    frac_coords_out = torch.tensor(np.concatenate(out_frac), dtype=torch.float32)
+    lattices_out = torch.tensor(np.stack(out_lattices), dtype=torch.float32)
+    atom_types_out = torch.tensor(np.concatenate(out_atom_types), dtype=torch.long)
+    return frac_coords_out, lattices_out, atom_types_out
+
+
+
+def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=False,symmetrize=False, symprec=0.1, **sample_kwargs):
     frac_coords = []
     num_atoms = []
     atom_types = []
     lattices = []
+    n_steps_used = []              # <-- ADD
+    final_coord_field_norm = []    # <-- ADD
+    final_lattice_field_norm = []  # <-- ADD
     input_data_list = []
     device = next(model.parameters()).device
 
@@ -66,6 +183,7 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
         if torch.cuda.is_available():
             batch.cuda()
         batch_frac_coords, batch_num_atoms, batch_atom_types = [], [], []
+        batch_n_steps_used, batch_final_coord_norm, batch_final_lattice_norm = [], [], []
         batch_lattices = []
         for eval_idx in range(num_evals):
             print(f'batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}')
@@ -73,28 +191,57 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
             'frac_coords': batch.frac_coords,
             'lattices_mat': lattice_params_to_matrix_torch(batch.lengths, batch.angles),
             }
-           
             if null_baseline:
-                out_frac = distorted['frac_coords'].detach().cpu()
-                out_lattices = distorted['lattices_mat'].detach().cpu()
+                # skip the model entirely -- "output" IS the initial structure,
+                # i.e. what a "do nothing" relaxer would produce
+                out_frac = init_structure['frac_coords'].detach().cpu()
+                out_lattices = init_structure['lattices_mat'].detach().cpu()
                 out_num_atoms = batch.num_atoms.detach().cpu()
                 out_atom_types = batch.atom_types.detach().cpu()
+
+                # no sampling happened, so these have no meaning -- fill with
+                # NaN rather than 0, so they're visibly "not applicable"
+                # rather than silently misread as "converged instantly"
+                batch_size = batch.num_graphs
+                nan_placeholder = torch.full((batch_size,), float('nan'))
+                out_n_steps_used = nan_placeholder
+                out_final_coord_norm = nan_placeholder
+                out_final_lattice_norm = nan_placeholder
             else:
+
+
                 outputs, traj = model.sample(batch, init_structure=init_structure, **sample_kwargs)
                 out_frac = outputs['frac_coords'].detach().cpu()
                 out_lattices = outputs['lattices'].detach().cpu()
                 out_num_atoms = outputs['num_atoms'].detach().cpu()
                 out_atom_types = outputs['atom_types'].detach().cpu()
 
+                if symmetrize:
+                    out_frac, out_lattices, out_atom_types = symmetrize_batch(
+                        out_frac, out_lattices, out_atom_types, out_num_atoms, symprec=symprec
+                    )
+                out_n_steps_used = traj['n_steps_used']
+                out_final_coord_norm = traj['final_coord_field_norm']
+                out_final_lattice_norm = traj['final_lattice_field_norm']
+
+
             batch_frac_coords.append(out_frac)
             batch_num_atoms.append(out_num_atoms)
             batch_atom_types.append(out_atom_types)
             batch_lattices.append(out_lattices)
+            batch_n_steps_used.append(out_n_steps_used)
+            batch_final_coord_norm.append(out_final_coord_norm)
+            batch_final_lattice_norm.append(out_final_lattice_norm)
+
+
 
         frac_coords.append(torch.stack(batch_frac_coords, dim=0))
         num_atoms.append(torch.stack(batch_num_atoms, dim=0))
         atom_types.append(torch.stack(batch_atom_types, dim=0))
         lattices.append(torch.stack(batch_lattices, dim=0))
+        n_steps_used.append(torch.stack(batch_n_steps_used, dim=0))
+        final_coord_field_norm.append(torch.stack(batch_final_coord_norm, dim=0))
+        final_lattice_field_norm.append(torch.stack(batch_final_lattice_norm, dim=0))
 
         input_data_list = input_data_list + batch.to_data_list()
 
@@ -104,9 +251,13 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
     lattices = torch.cat(lattices, dim=1)
     lengths, angles = lattices_to_params_shape(lattices)
     input_data_batch = Batch.from_data_list(input_data_list)
+    n_steps_used = torch.cat(n_steps_used, dim=1)                       
+    final_coord_field_norm = torch.cat(final_coord_field_norm, dim=1)   
+    final_lattice_field_norm = torch.cat(final_lattice_field_norm, dim=1)  
 
     return (
         frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch
+        ,n_steps_used, final_coord_field_norm, final_lattice_field_norm,
     )
 
 
@@ -119,20 +270,36 @@ def main(args):
 
     if torch.cuda.is_available():
         model.to('cuda')
+       
+    
+    if args.eval_size is not None:
+        test_loader = subsample_loader(test_loader, args.eval_size, seed=args.eval_seed)
+
+    material_ids = None
+    test_dataset_cfgs = cfg.data.datamodule.datasets.test
+    if len(test_dataset_cfgs) == 1:
+        material_ids = get_material_ids_for_loader(test_loader, test_dataset_cfgs[0].path)
+    else:
+        print('WARNING: multiple test datasets configured -- material_id '
+              'retrieval not implemented for this case, saving without it.')
+
+
 
     print('Perturb-and-recover evaluation (relaxation feasibility test).')
 
     N = args.ode_int_steps if args.ode_int_steps is not None else round(1 / args.step_lr)
 
     start_time = time.time()
-    (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch) = relax(
+    (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch,
+     n_steps_used, final_coord_field_norm, final_lattice_field_norm) = relax(
         test_loader, model, num_evals=args.num_evals,
         coord_noise=args.coord_noise, lattice_noise=args.lattice_noise,
+        symmetrize=args.symmetrize, symprec=args.symprec,        
         null_baseline=args.null_baseline,
         N=N, eta=args.eta, sampler=args.sampler, mu=args.mu,
         anneal_lattice=args.anneal_lattice, anneal_coords=args.anneal_coords, anneal_type=args.anneal_type, anneal_slope=args.anneal_slope, anneal_offset=args.anneal_offset,
         guide_factor=args.guide_factor,
-        grad_stop=args.grad_stop, min_steps=args.min_steps
+        grad_stop=args.grad_stop, grad_stop_coord=args.grad_stop_coord, grad_stop_lattice=args.grad_stop_lattice, min_steps=args.min_steps
     )
 
     if args.label == '':
@@ -150,7 +317,11 @@ def main(args):
         'lengths': lengths,
         'angles': angles,
         'time': time.time() - start_time,
+        'n_steps_used': n_steps_used,
+        'final_coord_field_norm': final_coord_field_norm, 
+        'final_lattice_field_norm': final_lattice_field_norm,  
     }, model_path / diff_out_name)
+
 
     print(f'Saved to {model_path / diff_out_name}')
 
@@ -198,6 +369,27 @@ if __name__ == '__main__':
     step_group.add_argument('--grad-stop', dest='grad_stop', type=float, default=None,
                          help="EqM adaptive early stop: field-norm threshold")
     step_group.add_argument('--min-steps', dest='min_steps', type=int, default=1)
+
+
+    parser.add_argument('--symmetrize', action='store_true',
+                         help='apply post-hoc SpacegroupAnalyzer symmetrization to the final structure')
+    parser.add_argument('--symprec', type=float, default=0.1,
+                         help='symmetry-finding tolerance for --symmetrize')
+
+    
+    parser.add_argument('--eval_size', type=int, default=None,
+                         help='evaluate on a random subsample of this many structures '
+                              'instead of the full test set (for fast iteration); '
+                              'None = full test set')
+    parser.add_argument('--eval_seed', type=int, default=0,
+                         help='random seed for --eval_size subsampling (fixed default '
+                              'so repeated runs at the same size are comparable)')
+
+    step_group.add_argument('--grad-stop-coord', dest='grad_stop_coord', type=float, default=None,
+                         help="EqM adaptive early stop: coord-field-norm threshold (overrides --grad-stop for coords)")
+
+    step_group.add_argument('--grad-stop-lattice', dest='grad_stop_lattice', type=float, default=None,
+                         help="EqM adaptive early stop: lattice-field-norm threshold (overrides --grad-stop for lattice)")
 
     args = parser.parse_args()
     main(args) 
