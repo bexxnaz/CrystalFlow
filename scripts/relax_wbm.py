@@ -322,7 +322,12 @@ def save_field_norm_csv(
                     })
                 else:
                     for step in range(n_steps_this):
-                        if step + 1 > n_steps_used_val:   # <-- ADD: stop once this structure has frozen
+                        # keep steps up to and INCLUDING the freeze step so the
+                        # last row's norm matches final_{coord,lattice}_field_norm
+                        # in the .pt (flow.sample indexes coord_norm_traj at
+                        # n_steps_used). step is 0-indexed, n_steps_used_val counts
+                        # steps, so the freeze row is step == n_steps_used_val.
+                        if step > n_steps_used_val:
                             break
                         rows.append({
                             'material_id': mat_id, 'eval_idx': e, 'step': step + 1,
@@ -348,8 +353,8 @@ def main(args):
 
     if torch.cuda.is_available():
         model.to('cuda')
-       
-    
+    model.eval()
+
     if args.eval_size is not None:
         test_loader = subsample_loader(test_loader, args.eval_size, seed=args.eval_seed)
 
@@ -365,7 +370,16 @@ def main(args):
 
     print('Perturb-and-recover evaluation (relaxation feasibility test).')
 
-    N = args.ode_int_steps if args.ode_int_steps is not None else round(1 / args.step_lr)
+    if args.ode_int_steps is not None:
+        N = args.ode_int_steps
+    elif args.step_lr is not None and args.step_lr > 0:
+        N = round(1 / args.step_lr)
+    else:
+        raise SystemExit(
+            "No integration step count given. Pass -N / --ode-int-steps "
+            "(e.g. -N 1000), or a positive --step_lr. The default step_lr=-1 "
+            "is a sentinel and is not resolved by this script."
+        )
 
     start_time = time.time()
     (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch,

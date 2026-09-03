@@ -452,7 +452,14 @@ class CSPFlow(BaseModule):
         **kwargs,
     ):
         if N is None:
+            if step_lr is None:
+                raise ValueError("sample() needs either N or step_lr.")
             N = round(1 / step_lr)
+        if N < 1:
+            raise ValueError(
+                f"sample() got N={N}; pass a positive integration step count "
+                f"(e.g. -N 1000) or a positive step_lr."
+            )
 
         batch_size = batch.num_graphs
 
@@ -675,7 +682,7 @@ class CSPFlow(BaseModule):
                 active_graph_bc = active_graph.view(batch_size, *([1] * (l_t.dim() - 1)))
 
                 if not self.keep_lattice:
-                     
+                    l_t = torch.where(active_graph_bc, l_t + eta * pred_l, l_t)
                     m_l = torch.where(active_graph_bc, pred_l, m_l)
                 if not self.keep_coords:
                     f_t = torch.where(active_node, (f_t + eta * pred_f) % 1.0, f_t)
@@ -713,54 +720,54 @@ class CSPFlow(BaseModule):
         else:
             last_step = N
 
-    rng = range(0, last_step + 1)
+        rng = range(0, last_step + 1)
 
-    # ---- stack per-step norm history into [steps, batch] trajectories ----
-    if coord_norm_history:
-        coord_norm_traj = torch.stack(coord_norm_history[:last_step], dim=0)
-        lattice_norm_traj = torch.stack(lattice_norm_history[:last_step], dim=0)
-    else:
-        coord_norm_traj = torch.zeros(0, batch_size)
-        lattice_norm_traj = torch.zeros(0, batch_size)
+        # ---- stack per-step norm history into [steps, batch] trajectories ----
+        if coord_norm_history:
+            coord_norm_traj = torch.stack(coord_norm_history[:last_step], dim=0)
+            lattice_norm_traj = torch.stack(lattice_norm_history[:last_step], dim=0)
+        else:
+            coord_norm_traj = torch.zeros(0, batch_size)
+            lattice_norm_traj = torch.zeros(0, batch_size)
 
-    n_steps_used = last_step_per_graph.clone()
+        n_steps_used = last_step_per_graph.clone()
 
-    # ---- per-graph final field norm ----
-    # CHANGED: gather each graph's OWN logged norm at its own convergence
-    # step (or its last-computed norm at t=N if it never converged), from
-    # coord_norm_traj/lattice_norm_traj -- instead of relying on pred_f/
-    # pred_l as they happen to be left over from the last globally-executed
-    # loop iteration. The old approach was only correct if a frozen graph's
-    # decoder output is guaranteed identical across iterations once its
-    # input stops changing (true for pure per-graph message passing, but
-    # would silently break with any cross-graph batch effect, e.g.
-    # BatchNorm). This version makes no such assumption.
-    if coord_norm_traj.shape[0] > 0:
-        graph_idx = torch.arange(batch_size, device=coord_norm_traj.device)
-        step_idx = n_steps_used.clamp(max=coord_norm_traj.shape[0] - 1).to(coord_norm_traj.device)
-        final_coord_field_norm = coord_norm_traj[step_idx, graph_idx]
-        final_lattice_field_norm = lattice_norm_traj[step_idx, graph_idx]
-    else:
-        final_coord_field_norm = torch.zeros(batch_size)
-        final_lattice_field_norm = torch.zeros(batch_size)
+        # ---- per-graph final field norm ----
+        # CHANGED: gather each graph's OWN logged norm at its own convergence
+        # step (or its last-computed norm at t=N if it never converged), from
+        # coord_norm_traj/lattice_norm_traj -- instead of relying on pred_f/
+        # pred_l as they happen to be left over from the last globally-executed
+        # loop iteration. The old approach was only correct if a frozen graph's
+        # decoder output is guaranteed identical across iterations once its
+        # input stops changing (true for pure per-graph message passing, but
+        # would silently break with any cross-graph batch effect, e.g.
+        # BatchNorm). This version makes no such assumption.
+        if coord_norm_traj.shape[0] > 0:
+            graph_idx = torch.arange(batch_size, device=coord_norm_traj.device)
+            step_idx = n_steps_used.clamp(max=coord_norm_traj.shape[0] - 1).to(coord_norm_traj.device)
+            final_coord_field_norm = coord_norm_traj[step_idx, graph_idx]
+            final_lattice_field_norm = lattice_norm_traj[step_idx, graph_idx]
+        else:
+            final_coord_field_norm = torch.zeros(batch_size)
+            final_lattice_field_norm = torch.zeros(batch_size)
 
-    if self.pred_type:
-        stack_atom_types = torch.stack([traj[i]['atom_types'] for i in rng])
-    else:
-        stack_atom_types = batch.atom_types
+        if self.pred_type:
+            stack_atom_types = torch.stack([traj[i]['atom_types'] for i in rng])
+        else:
+            stack_atom_types = batch.atom_types
 
-    traj_stack = {
-        'num_atoms': batch.num_atoms,
-        'atom_types': stack_atom_types,
-        'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in rng]),
-        'all_lattices': torch.stack([traj[i]['lattices'] for i in rng]),
-        'n_steps_used': n_steps_used.detach().cpu(),
-        'final_coord_field_norm': final_coord_field_norm.detach().cpu(),
-        'final_lattice_field_norm': final_lattice_field_norm.detach().cpu(),
-        'coord_field_norm_traj': coord_norm_traj,
-        'lattice_field_norm_traj': lattice_norm_traj,
-    }
-    return traj[last_step], traj_stack
+        traj_stack = {
+            'num_atoms': batch.num_atoms,
+            'atom_types': stack_atom_types,
+            'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in rng]),
+            'all_lattices': torch.stack([traj[i]['lattices'] for i in rng]),
+            'n_steps_used': n_steps_used.detach().cpu(),
+            'final_coord_field_norm': final_coord_field_norm.detach().cpu(),
+            'final_lattice_field_norm': final_lattice_field_norm.detach().cpu(),
+            'coord_field_norm_traj': coord_norm_traj,
+            'lattice_field_norm_traj': lattice_norm_traj,
+        }
+        return traj[last_step], traj_stack
 
     def single_time_decoder(self, t, **kwargs):
         batch_size = kwargs["num_atoms"].shape[0]
