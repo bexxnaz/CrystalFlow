@@ -81,7 +81,7 @@ class CrystDataModule(pl.LightningDataModule):
         construct datasets and assign data scalers.
         """
         if stage is None or stage == "fit":
-            if not hasattr(self, "train_dataset"):
+            if self.train_dataset is None:
                 self.train_dataset = hydra.utils.instantiate(self.datasets.train)
             self.val_datasets = [
                 hydra.utils.instantiate(dataset_cfg)

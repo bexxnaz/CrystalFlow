@@ -8,6 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from torch_geometric.data import Batch
 
+import hydra
+from torch.utils.data import ConcatDataset
+from torch_geometric.loader import DataLoader
+
 from eval_utils import load_model, lattices_to_params_shape, recommand_step_lr
 
 from pymatgen.core.structure import Structure
@@ -345,25 +349,73 @@ def save_field_norm_csv(
     return df
 
 
+def build_split_loader(cfg, model, split, test_bs=None):
+    """Build a non-shuffled loader over the train / val / test split straight
+    from the saved config, assigning the model's scalers to each dataset.
+
+    This deliberately bypasses CrystDataModule.setup(): its 'fit' branch does
+    `self.train_dataset.lattice_scaler = ...` guarded by
+    `if not hasattr(self, "train_dataset")`, but __init__ always creates that
+    attribute (as None), so when load_model passes a scaler_path the train
+    dataset is never instantiated and setup() raises AttributeError on None.
+
+    Returns (loader, dataset_cfgs) -- dataset_cfgs is the list of dataset
+    configs backing the loader, for material_id lookup.
+    """
+    ds_group = cfg.data.datamodule.datasets
+    if split == 'train':
+        ds_cfgs = [ds_group.train]
+    elif split == 'val':
+        ds_cfgs = list(ds_group.val)
+    elif split == 'test':
+        ds_cfgs = list(ds_group.test)
+    else:
+        raise ValueError(f"unknown split {split!r} (expected train/val/test)")
+
+    lattice_scaler = getattr(model, 'lattice_scaler', None)
+    scaler = getattr(model, 'scaler', None)
+    scalers = getattr(model, 'scalers', None)
+    if scaler is None or lattice_scaler is None:
+        raise RuntimeError(
+            "model has no scaler / lattice_scaler -- expected "
+            "lattice_scaler.pt / prop_scaler.pt / prop_scalers.pt next to the "
+            "checkpoint (load_model loads them). CrystDataset.__getitem__ needs "
+            "them to iterate.")
+
+    datasets = [hydra.utils.instantiate(c) for c in ds_cfgs]
+    for ds in datasets:
+        ds.lattice_scaler = lattice_scaler
+        ds.scaler = scaler
+        ds.scalers = scalers
+
+    dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
+    bs = test_bs or cfg.data.datamodule.batch_size.test
+    return DataLoader(dataset, batch_size=bs, shuffle=False), ds_cfgs
+
+
 def main(args):
     # load_data if do reconstruction.
     model_path = Path(args.model_path)
-    model, test_loader, cfg = load_model(
-        model_path, load_data=True, test_bs=args.test_bs)
+    # load_data=False: we build the loader ourselves via build_split_loader so
+    # --split train/val also works (load_model's testing=False path is broken).
+    model, _, cfg = load_model(model_path, load_data=False, test_bs=args.test_bs)
 
     if torch.cuda.is_available():
         model.to('cuda')
     model.eval()
 
+    test_loader, split_dataset_cfgs = build_split_loader(
+        cfg, model, args.split, test_bs=args.test_bs)
+    print(f'Evaluating on the {args.split!r} split.')
+
     if args.eval_size is not None:
         test_loader = subsample_loader(test_loader, args.eval_size, seed=args.eval_seed)
 
     material_ids = None
-    test_dataset_cfgs = cfg.data.datamodule.datasets.test
-    if len(test_dataset_cfgs) == 1:
-        material_ids = get_material_ids_for_loader(test_loader, test_dataset_cfgs[0].path)
+    if len(split_dataset_cfgs) == 1:
+        material_ids = get_material_ids_for_loader(test_loader, split_dataset_cfgs[0].path)
     else:
-        print('WARNING: multiple test datasets configured -- material_id '
+        print(f'WARNING: multiple {args.split} datasets configured -- material_id '
               'retrieval not implemented for this case, saving without it.')
 
 
@@ -435,6 +487,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_evals', metavar='NEVAL', default=1, type=int, help="num repeat for each sample.")
     parser.add_argument('--test_bs', type=int, help="overwrite testset batchsize.")
     parser.add_argument('--label', default='', help="label for output")
+    parser.add_argument('--split', choices=['test', 'train', 'val'], default='test',
+                        help="which data split to evaluate on")
 
     step_group = parser.add_argument_group('evaluate step')
     step_group.add_argument('--dataset', help='load default step_lr of which dataset; effect when step_lr is -1')
