@@ -2,9 +2,8 @@
 #SBATCH -A berzelius-2026-109
 #SBATCH --gpus=1
 #SBATCH -C thin
-#SBATCH --reservation=devel
-#SBATCH -t 02:00:00
-#SBATCH -J mp_20
+#SBATCH -t 2-10:00:00
+#SBATCH -J wbmtest_new
 #SBATCH -o log/%x-%j.out
 #SBATCH -e log/%x-%j.err
 
@@ -14,8 +13,8 @@ mamba activate crystalflow
 source .env
 
 MODEL_PATH=/proj/berzelius-2022-164/users/x_behri/CrystalFlow/hydra/singlerun/CSP-mp20-new-eqm
-DATASET=mp_20
-LABEL=mp20_equilibrium_check
+DATASET=wbm
+LABEL=wbmtest_new_t1
 
 
 # python scripts/relax_wbm.py --model_path $MODEL_PATH \
@@ -23,27 +22,16 @@ LABEL=mp20_equilibrium_check
 #   --anneal_coords --anneal_slope 5 \
 #   --label $LABEL 
 
-python scripts/relax_wbm.py \
-  --model_path $MODEL_PATH \
-  --dataset $DATASET \
-  --ode-int-steps 250 \
-  --eta 0.03 \
-  --sampler gd \
-  --grad-stop 0.05 --min-steps 5 \
-  --eval_size 100 \
-  --label $LABEL \
-
-
-
 # python scripts/relax_wbm.py \
 #   --model_path $MODEL_PATH \
 #   --dataset $DATASET \
 #   --ode-int-steps 250 \
 #   --eta 0.03 \
 #   --sampler gd \
-#   --grad-stop-coord 0.03 --grad-stop-lattice 0.02 --min-steps 5 \
+#   --grad-stop 0.05 --min-steps 5 \
 #   --anneal_coords --anneal_slope 5 \
 #   --label $LABEL \
+
 
 # python scripts/compute_metrics.py \
 #   --root_path $MODEL_PATH \
@@ -52,11 +40,11 @@ python scripts/relax_wbm.py \
 #   --label $LABEL \
 #   --njobs 8
 
-# python scripts/compute_metrics.py \
-#   --root_path $MODEL_PATH \
-#   --tasks geo_opt_mbd \
-#   --gt_file /proj/berzelius-2022-164/users/x_behri/wbmdata-crystalflow/groundtruth.csv \
-#   --label $LABEL \
-#   -j 8 \
-#   --symprec 1e-2
+python scripts/compute_metrics.py \
+  --root_path $MODEL_PATH \
+  --tasks geo_opt_mbd \
+  --gt_file /proj/berzelius-2022-164/users/x_behri/wbmdata-crystalflow/groundtruth.csv \
+  --label $LABEL \
+  -j 8 \
+  --symprec 1e-2
 
