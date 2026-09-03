@@ -553,7 +553,16 @@ class CSPFlow(BaseModule):
             m_f = torch.zeros_like(f_t)
             if self.pred_type:
                 m_t = torch.zeros_like(t_t)
-
+        
+        # ---- per-graph convergence state ----
+        converged = torch.zeros(batch_size, dtype=torch.bool, device=self.device)  # True = frozen
+        last_step_per_graph = torch.full((batch_size,), N, dtype=torch.long, device=self.device)
+        grad_stop_active = (grad_stop is not None) or (grad_stop_coord is not None) or (grad_stop_lattice is not None)
+        gs_coord = grad_stop_coord if grad_stop_coord is not None else grad_stop
+        gs_lattice = grad_stop_lattice if grad_stop_lattice is not None else grad_stop
+        
+        coord_norm_history = []
+        lattice_norm_history = []
 
         last_step = N  
 
@@ -644,36 +653,52 @@ class CSPFlow(BaseModule):
                 pred_f = guide_factor * pred_f_guide + (1 - guide_factor) * pred_f
             # ========= pred each step end =========
 
-            # ========= update each step start =========
+            step_coord_norm_pg = (scatter(pred_f.norm(dim=-1), batch.batch, dim=0, reduce='mean')
+                                   if not self.keep_coords else torch.zeros(batch_size, device=self.device))
+            step_lattice_norm_pg = (pred_l.flatten(1).norm(dim=-1)
+                                     if not self.keep_lattice else torch.zeros(batch_size, device=self.device))
+            coord_norm_history.append(step_coord_norm_pg.detach().cpu())
+            lattice_norm_history.append(step_lattice_norm_pg.detach().cpu())
+
+            # ---- per-graph convergence check (BEFORE this step's update) ----
+            if self.use_eqm and grad_stop_active and t >= min_steps:
+                coord_ok = (gs_coord is None) | (step_coord_norm_pg < gs_coord)
+                lattice_ok = (gs_lattice is None) | (step_lattice_norm_pg < gs_lattice)
+                newly_converged = coord_ok & lattice_ok & (~converged)
+                last_step_per_graph[newly_converged] = t - 1
+                converged = converged | newly_converged
+
+            # ---- masked update: converged graphs/nodes are frozen ----
             if self.use_eqm:
+                active_graph = ~converged
+                active_node = active_graph[batch.batch].unsqueeze(-1)
+                active_graph_bc = active_graph.view(batch_size, *([1] * (l_t.dim() - 1)))
+
                 if not self.keep_lattice:
-                    l_t = l_t + eta * pred_l
-                    m_l = pred_l
+                     
+                    m_l = torch.where(active_graph_bc, pred_l, m_l)
                 if not self.keep_coords:
-                    f_t = (f_t + eta * pred_f) % 1.0
-                    m_f = pred_f
+                    f_t = torch.where(active_node, (f_t + eta * pred_f) % 1.0, f_t)
+                    m_f = torch.where(active_node, pred_f, m_f)
                 if self.pred_type:
-                    t_t = t_t + eta * pred_t
-                    m_t = pred_t
+                    t_t = torch.where(active_node, t_t + eta * pred_t, t_t)
+                    m_t = torch.where(active_node, pred_t, m_t)
             else:
                 l_t = l_t + pred_l / N if not self.keep_lattice else l_t
                 f_t = f_t + pred_f / N if not self.keep_coords else f_t
                 f_t = f_t % 1.0
                 if self.pred_type:
                     t_t = t_t + pred_t / N
-            # ========= update each step end =========
 
-            # ========= build trajectory start =========
             if self.lattice_polar:
                 lattices_mat_t = lattice_polar_build_torch(l_t)
             else:
                 lattices_mat_t = l_t
 
             if self.pred_type:
-                if self.type_encoding is None:
-                    atom_types = torch.argmax(t_t, dim=-1) + 1
-                else:
-                    atom_types = self.type_encoding.decode_types(t_t)
+                atom_types = (torch.argmax(t_t, dim=-1) + 1 if self.type_encoding is None
+                              else self.type_encoding.decode_types(t_t))
+
 
             traj[t] = {
                 'num_atoms': batch.num_atoms,
@@ -681,68 +706,61 @@ class CSPFlow(BaseModule):
                 'frac_coords': f_t,
                 'lattices': lattices_mat_t,
             }
-            # ========= build trajectory end =========
-            gs_coord = grad_stop_coord if grad_stop_coord is not None else grad_stop
-            gs_lattice = grad_stop_lattice if grad_stop_lattice is not None else grad_stop
 
-            if self.use_eqm and (gs_coord is not None or gs_lattice is not None) and t >= min_steps:
-                if not self.keep_coords:
-                    coord_field_norm = pred_f.norm(dim=-1).mean()
-                else:
-                    coord_field_norm = torch.tensor(0.0, device=self.device)
-                if not self.keep_lattice:
-                    # mean L2 norm per graph, averaged over the batch
-                    lattice_field_norm = pred_l.flatten(1).norm(dim=-1).mean()
-                else:
-                    lattice_field_norm = torch.tensor(0.0, device=self.device)
-
-                coord_ok = (gs_coord is None) or (coord_field_norm < gs_coord)
-                lattice_ok = (gs_lattice is None) or (lattice_field_norm < gs_lattice)
-
-                if coord_ok and lattice_ok:
-                    last_step = t
-                    break
-
-        rng = range(0, last_step + 1)
-
-        # stack final trajectory
-        # >>> ADD: per-graph convergence diagnostics from the LAST computed field <
-        with torch.no_grad():
-            if not self.keep_coords:
-                per_atom_coord_norm = pred_f.norm(dim=-1)                          # [N_nodes]
-                final_coord_field_norm = scatter(
-                    per_atom_coord_norm, batch.batch, dim=0, reduce='mean'
-                )                                                                   # [B]
-            else:
-                final_coord_field_norm = torch.zeros(batch_size, device=self.device)
-
-            if not self.keep_lattice:
-                final_lattice_field_norm = pred_l.flatten(1).norm(dim=-1)          # [B], already per-graph
-            else:
-                final_lattice_field_norm = torch.zeros(batch_size, device=self.device)
-
-        n_steps_used = torch.full((batch_size,), last_step, device=self.device, dtype=torch.long)
-        # <<< END ADD
-
-        # stack final trajectory
-        if self.pred_type:
-            stack_atom_types = torch.stack([traj[i]['atom_types'] for i in rng])
+            if self.use_eqm and grad_stop_active and converged.all():
+                last_step = t
+                break
         else:
-            stack_atom_types = batch.atom_types
+            last_step = N
 
-        traj_stack = {
-            'num_atoms': batch.num_atoms,
-            'atom_types': stack_atom_types,
-            'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in rng]),
-            'all_lattices': torch.stack([traj[i]['lattices'] for i in rng]),
-            # >>> ADD
-            'n_steps_used': n_steps_used.detach().cpu(),
-            'final_coord_field_norm': final_coord_field_norm.detach().cpu(),
-            'final_lattice_field_norm': final_lattice_field_norm.detach().cpu(),
-            # <<< END ADD
-        }
+    rng = range(0, last_step + 1)
 
-        return traj[last_step], traj_stack
+    # ---- stack per-step norm history into [steps, batch] trajectories ----
+    if coord_norm_history:
+        coord_norm_traj = torch.stack(coord_norm_history[:last_step], dim=0)
+        lattice_norm_traj = torch.stack(lattice_norm_history[:last_step], dim=0)
+    else:
+        coord_norm_traj = torch.zeros(0, batch_size)
+        lattice_norm_traj = torch.zeros(0, batch_size)
+
+    n_steps_used = last_step_per_graph.clone()
+
+    # ---- per-graph final field norm ----
+    # CHANGED: gather each graph's OWN logged norm at its own convergence
+    # step (or its last-computed norm at t=N if it never converged), from
+    # coord_norm_traj/lattice_norm_traj -- instead of relying on pred_f/
+    # pred_l as they happen to be left over from the last globally-executed
+    # loop iteration. The old approach was only correct if a frozen graph's
+    # decoder output is guaranteed identical across iterations once its
+    # input stops changing (true for pure per-graph message passing, but
+    # would silently break with any cross-graph batch effect, e.g.
+    # BatchNorm). This version makes no such assumption.
+    if coord_norm_traj.shape[0] > 0:
+        graph_idx = torch.arange(batch_size, device=coord_norm_traj.device)
+        step_idx = n_steps_used.clamp(max=coord_norm_traj.shape[0] - 1).to(coord_norm_traj.device)
+        final_coord_field_norm = coord_norm_traj[step_idx, graph_idx]
+        final_lattice_field_norm = lattice_norm_traj[step_idx, graph_idx]
+    else:
+        final_coord_field_norm = torch.zeros(batch_size)
+        final_lattice_field_norm = torch.zeros(batch_size)
+
+    if self.pred_type:
+        stack_atom_types = torch.stack([traj[i]['atom_types'] for i in rng])
+    else:
+        stack_atom_types = batch.atom_types
+
+    traj_stack = {
+        'num_atoms': batch.num_atoms,
+        'atom_types': stack_atom_types,
+        'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in rng]),
+        'all_lattices': torch.stack([traj[i]['lattices'] for i in rng]),
+        'n_steps_used': n_steps_used.detach().cpu(),
+        'final_coord_field_norm': final_coord_field_norm.detach().cpu(),
+        'final_lattice_field_norm': final_lattice_field_norm.detach().cpu(),
+        'coord_field_norm_traj': coord_norm_traj,
+        'lattice_field_norm_traj': lattice_norm_traj,
+    }
+    return traj[last_step], traj_stack
 
     def single_time_decoder(self, t, **kwargs):
         batch_size = kwargs["num_atoms"].shape[0]

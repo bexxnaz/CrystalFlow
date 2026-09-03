@@ -176,6 +176,8 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
     n_steps_used = []              # <-- ADD
     final_coord_field_norm = []    # <-- ADD
     final_lattice_field_norm = []  # <-- ADD
+    coord_norm_traj_all = []    # <-- ADD
+    lattice_norm_traj_all = []  # <-- ADD
     input_data_list = []
     device = next(model.parameters()).device
 
@@ -185,6 +187,7 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
         batch_frac_coords, batch_num_atoms, batch_atom_types = [], [], []
         batch_n_steps_used, batch_final_coord_norm, batch_final_lattice_norm = [], [], []
         batch_lattices = []
+        batch_coord_traj, batch_lattice_traj = [], []
         for eval_idx in range(num_evals):
             print(f'batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}')
             init_structure = {
@@ -198,6 +201,8 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
                 out_lattices = init_structure['lattices_mat'].detach().cpu()
                 out_num_atoms = batch.num_atoms.detach().cpu()
                 out_atom_types = batch.atom_types.detach().cpu()
+                out_coord_traj = torch.zeros(0, batch.num_graphs)   # <-- ADD: nothing to record
+                out_lattice_traj = torch.zeros(0, batch.num_graphs) # <-- ADD
 
                 # no sampling happened, so these have no meaning -- fill with
                 # NaN rather than 0, so they're visibly "not applicable"
@@ -215,6 +220,8 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
                 out_lattices = outputs['lattices'].detach().cpu()
                 out_num_atoms = outputs['num_atoms'].detach().cpu()
                 out_atom_types = outputs['atom_types'].detach().cpu()
+                out_coord_traj = traj['coord_field_norm_traj']      # <-- ADD
+                out_lattice_traj = traj['lattice_field_norm_traj']  # <-- ADD
 
                 if symmetrize:
                     out_frac, out_lattices, out_atom_types = symmetrize_batch(
@@ -232,6 +239,8 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
             batch_n_steps_used.append(out_n_steps_used)
             batch_final_coord_norm.append(out_final_coord_norm)
             batch_final_lattice_norm.append(out_final_lattice_norm)
+            batch_coord_traj.append(out_coord_traj)    # <-- ADD
+            batch_lattice_traj.append(out_lattice_traj) # <-- ADD
 
 
 
@@ -242,6 +251,8 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
         n_steps_used.append(torch.stack(batch_n_steps_used, dim=0))
         final_coord_field_norm.append(torch.stack(batch_final_coord_norm, dim=0))
         final_lattice_field_norm.append(torch.stack(batch_final_lattice_norm, dim=0))
+        coord_norm_traj_all.append(batch_coord_traj)     # <-- ADD: list of lists (ragged across batches)
+        lattice_norm_traj_all.append(batch_lattice_traj) # <-- ADD
 
         input_data_list = input_data_list + batch.to_data_list()
 
@@ -258,8 +269,75 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
     return (
         frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch
         ,n_steps_used, final_coord_field_norm, final_lattice_field_norm,
+        coord_norm_traj_all, lattice_norm_traj_all,
     )
 
+def save_field_norm_csv(
+    csv_path, material_ids, num_atoms, n_steps_used,
+    coord_norm_traj_all, lattice_norm_traj_all,
+):
+    """Per-structure, per-STEP summary CSV: one row per (material_id,
+    eval_idx, step), covering the FULL convergence trajectory rather than
+    just the final norm at freeze time -- lets you plot/inspect how
+    final_coord_field_norm / final_lattice_field_norm actually decay over
+    the sampling trajectory for any given structure.
+
+    coord_norm_traj_all / lattice_norm_traj_all: ragged nested lists,
+    shape [n_batches][num_evals] of tensors [steps_this_batch_ran, batch_size],
+    as returned by relax(). material_ids is a flat list aligned to the
+    structure order relax() iterated (same convention as elsewhere).
+    """
+    num_atoms_np = num_atoms.numpy()          # [num_evals, n_structs]
+    n_steps_np = n_steps_used.numpy()          # [num_evals, n_structs]
+
+    n_structs = num_atoms_np.shape[1]
+    if material_ids is not None and len(material_ids) != n_structs:
+        print(f'WARNING: material_id count ({len(material_ids)}) != number of '
+              f'evaluated structures ({n_structs}) -- writing CSV without '
+              f'material_id (order/count mismatch, do not trust an unaligned join).')
+        material_ids = None
+
+    rows = []
+    struct_offset = 0
+    for batch_coord_traj, batch_lattice_traj in zip(coord_norm_traj_all, lattice_norm_traj_all):
+        # batch_coord_traj is a list of length num_evals, each [steps, batch_size]
+        batch_size = batch_coord_traj[0].shape[1] if batch_coord_traj[0].numel() > 0 else \
+                     batch_lattice_traj[0].shape[1]
+
+        for e, (coord_traj, lattice_traj) in enumerate(zip(batch_coord_traj, batch_lattice_traj)):
+            n_steps_this = coord_traj.shape[0]  # 0 for null_baseline
+            for local_i in range(batch_size):
+                global_i = struct_offset + local_i
+                mat_id = material_ids[global_i] if material_ids is not None else None
+                n_atoms_val = int(num_atoms_np[e, global_i])
+                n_steps_used_val = float(n_steps_np[e, global_i])
+
+                if n_steps_this == 0:
+                    # null baseline: no trajectory, one row with NaN norms
+                    rows.append({
+                        'material_id': mat_id, 'eval_idx': e, 'step': None,
+                        'n_atoms': n_atoms_val, 'n_steps_used': n_steps_used_val,
+                        'coord_field_norm': float('nan'),
+                        'lattice_field_norm': float('nan'),
+                    })
+                else:
+                    for step in range(n_steps_this):
+                        if step + 1 > n_steps_used_val:   # <-- ADD: stop once this structure has frozen
+                            break
+                        rows.append({
+                            'material_id': mat_id, 'eval_idx': e, 'step': step + 1,
+                            'n_atoms': n_atoms_val, 'n_steps_used': n_steps_used_val,
+                            'coord_field_norm': float(coord_traj[step, local_i]),
+                            'lattice_field_norm': float(lattice_traj[step, local_i]),
+                        })
+        struct_offset += batch_size
+
+    df = pd.DataFrame(rows)
+    df.to_csv(csv_path, index=False)
+    print(f'Saved per-step field-norm trajectory ({len(df)} rows, '
+          f'{df["material_id"].nunique() if material_ids is not None else n_structs} structures) '
+          f'to {csv_path}')
+    return df
 
 
 def main(args):
@@ -291,7 +369,7 @@ def main(args):
 
     start_time = time.time()
     (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch,
-     n_steps_used, final_coord_field_norm, final_lattice_field_norm) = relax(
+     n_steps_used, final_coord_field_norm, final_lattice_field_norm,coord_norm_traj_all, lattice_norm_traj_all) = relax(
         test_loader, model, num_evals=args.num_evals,
         coord_noise=args.coord_noise, lattice_noise=args.lattice_noise,
         symmetrize=args.symmetrize, symprec=args.symprec,        
@@ -304,8 +382,11 @@ def main(args):
 
     if args.label == '':
         diff_out_name = 'eval_diff.pt'
+        csv_out_name = 'eval_field_norms.csv'
     else:
         diff_out_name = f'eval_diff_{args.label}.pt'
+        csv_out_name = f'eval_field_norms_{args.label}.csv'
+ 
 
     torch.save({
         'eval_setting': args,
@@ -325,7 +406,13 @@ def main(args):
 
     print(f'Saved to {model_path / diff_out_name}')
 
-
+        
+    save_field_norm_csv(
+        model_path / csv_out_name,
+        material_ids, num_atoms, n_steps_used,
+        coord_norm_traj_all, lattice_norm_traj_all,
+    )
+ 
 
 
 if __name__ == '__main__':
