@@ -1,50 +1,25 @@
 import time
 import argparse
 import torch
-
-from tqdm import tqdm
-from torch.optim import Adam
 from pathlib import Path
-from types import SimpleNamespace
 from torch_geometric.data import Batch
-
 import hydra
 from torch.utils.data import ConcatDataset
 from torch_geometric.loader import DataLoader
-
-from eval_utils import load_model, lattices_to_params_shape, recommand_step_lr
-
+from eval_utils import load_model, lattices_to_params_shape
 from pymatgen.core.structure import Structure
 from pymatgen.core.lattice import Lattice
-from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-from pyxtal.symmetry import Group
-
-
-import copy
 
 import numpy as np
 from diffcsp.common.data_utils import (
-    EPSILON,
-    cart_to_frac_coords,
-    frac_to_cart_coords,
     lattice_params_to_matrix_torch,
     lattice_polar_build_torch,
-    lattice_polar_decompose_torch,
-    lengths_angles_to_volume,
-    mard,
-    min_distance_sqr_pbc,
 )
 
-import pandas as pd  # add if not already imported
-
+import pandas as pd
+import sys
 
 def get_material_ids_for_loader(loader, csv_path):
-    """Read the material_id column from the CSV the dataset was actually
-    built from, in the SAME order CrystDataset iterates it. A length check
-    guards against silent misalignment if preprocessing dropped/reordered
-    rows. If loader.dataset is a torch.utils.data.Subset (from
-    subsample_loader), the same subsetting is applied to material_ids so
-    the two stay in lockstep."""
     df = pd.read_csv(csv_path)
     if 'material_id' not in df.columns:
         print(f'WARNING: no material_id column in {csv_path} -- saving without it.')
@@ -69,10 +44,6 @@ def get_material_ids_for_loader(loader, csv_path):
 
 
 def subsample_loader(loader, n, seed=0):
-    """Return a new loader over a random subset of n structures from the
-    same underlying dataset, same batch_size/collate behavior. Use this to
-    iterate quickly (e.g. testing --symmetrize, tuning grad_stop) before
-    committing to a full-dataset run."""
     dataset = loader.dataset
     total = len(dataset)
     n = min(n, total)
@@ -83,13 +54,13 @@ def subsample_loader(loader, n, seed=0):
     print(f'Subsampled test set: {n} / {total} structures (seed={seed})')
     return new_loader
 
+
 def perturb_batch(batch, coord_noise, lattice_noise, device, model):
     frac_coords = batch.frac_coords.clone().to(device)
     frac_coords_distorted = (frac_coords + torch.randn_like(frac_coords) * coord_noise) % 1.0
 
     if model.lattice_polar:
         lattice_polar_gt = batch.lattice_polar.clone().to(device)
-        # perturb in the SAME space and SAME scale convention the model trained on
         lattice_polar_distorted = lattice_polar_gt + torch.randn_like(lattice_polar_gt) * lattice_noise
         lattices_mat_distorted = lattice_polar_build_torch(lattice_polar_distorted)
     else:
@@ -106,134 +77,249 @@ def perturb_batch(batch, coord_noise, lattice_noise, device, model):
 
 
 
-from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
+def build_mace_calculator(mace_model, device, default_dtype="float32", dispersion=False):
+    from pathlib import Path as _Path
+    if _Path(mace_model).exists():
+        from mace.calculators import MACECalculator
+        print(f'Loading custom MACE checkpoint: {mace_model} (dtype={default_dtype})')
+        return MACECalculator(model_paths=[mace_model], device=device,
+                               default_dtype=default_dtype)
+    else:
+        from mace.calculators import mace_mp
+        print(f'Loading MACE-MP foundation model (size={mace_model!r}, '
+              f'dtype={default_dtype}, dispersion={dispersion}) -- '
+              f'downloads weights on first use if not already cached.')
+        return mace_mp(model=mace_model, device=device,
+                        default_dtype=default_dtype, dispersion=dispersion)
+ 
+ 
+def _build_ase_atoms(frac_coords, lattice_matrix, atomic_numbers):
+    from ase import Atoms
+    return Atoms(
+        numbers=atomic_numbers.detach().cpu().numpy(),
+        scaled_positions=frac_coords.detach().cpu().numpy(),
+        cell=lattice_matrix.detach().cpu().numpy(),
+        pbc=True,
+    )
+ 
+ 
+def compute_mace_energy_trajectory(frac_traj, lattices_traj, num_atoms, atom_types,
+                                    mace_calc, stride=1):
+    T = frac_traj.shape[0]
+    n_graphs = num_atoms.shape[0]
+    frac_per_graph = torch.split(frac_traj, num_atoms.tolist(), dim=1)  
+    z_per_graph = torch.split(atom_types, num_atoms.tolist(), dim=0)     
+ 
+    results = []
+    for i in range(n_graphs):
+        n_atoms_i = int(num_atoms[i])
+        steps, e_tot, e_per_atom = [], [], []
+        for t in range(0, T, stride):
+            atoms = _build_ase_atoms(frac_per_graph[i][t], lattices_traj[t, i], z_per_graph[i])
+            atoms.calc = mace_calc
+            e = atoms.get_potential_energy()
+            steps.append(t)
+            e_tot.append(float(e))
+            e_per_atom.append(float(e) / n_atoms_i)
+        if steps[-1] != T - 1:  # always include the true final step
+            atoms = _build_ase_atoms(frac_per_graph[i][T - 1], lattices_traj[T - 1, i], z_per_graph[i])
+            atoms.calc = mace_calc
+            e = atoms.get_potential_energy()
+            steps.append(T - 1)
+            e_tot.append(float(e))
+            e_per_atom.append(float(e) / n_atoms_i)
+        results.append({'steps': steps, 'energy_total_eV': e_tot, 'energy_per_atom_eV': e_per_atom})
+ 
+    return results
+ 
+ 
 
-def symmetrize_batch(frac_coords, lattices_mat, atom_types, num_atoms, symprec=0.1):
-    """Post-hoc symmetrization of a batched sampler output. Splits the batch
-    into individual pymatgen Structures via num_atoms, symmetrizes each,
-    and reassembles into padded tensors. Falls back to the original
-    structure on any symmetrization failure (never drops a structure).
+def load_ground_truth_energies(gt_file, material_ids, mace_calc, num_atoms_ref=None):
+    gt_df = pd.read_csv(gt_file)
+    if 'material_id' not in gt_df.columns or 'cif' not in gt_df.columns:
+        raise ValueError(f"--gt_file {gt_file} needs 'material_id' and 'cif' columns "
+                          f"(same convention as compute_metrics.py's --gt_file).")
+    cif_by_id = dict(zip(gt_df['material_id'], gt_df['cif']))
 
-    IMPORTANT: symmetrization can reorder atoms within a structure, so
-    atom_types is re-derived from each symmetrized structure's own species
-    list -- do not assume the original atom_types tensor still lines up.
-    """
-    frac_coords = frac_coords.detach().cpu().numpy()
-    lattices_mat = lattices_mat.detach().cpu().numpy()
-    atom_types = atom_types.detach().cpu().numpy()
-    num_atoms_list = num_atoms.detach().cpu().numpy().tolist()
-    n_still_p1 = 0
-    n_exception = 0
-    n_changed = 0
-
-    out_frac, out_lattices, out_atom_types = [], [], []
-    offset = 0
-    for i, n in enumerate(num_atoms_list):
-        fc = frac_coords[offset:offset + n]
-        at = atom_types[offset:offset + n]
-        lat = lattices_mat[i]
-        offset += n
-
+    n_atoms_out, e_tot_out, e_per_atom_out = [], [], []
+    n_missing, n_failed, n_mismatch = 0, 0, 0
+    for idx, mat_id in enumerate(material_ids):
+        cif = cif_by_id.get(mat_id)
+        if cif is None:
+            n_missing += 1
+            n_atoms_out.append(None); e_tot_out.append(float('nan')); e_per_atom_out.append(float('nan'))
+            continue
         try:
-            struct = Structure(
-                lattice=Lattice(lat), species=at, coords=fc, coords_are_cartesian=False
-            )
-            sga = SpacegroupAnalyzer(struct, symprec=symprec)
-            sym_struct = sga.get_symmetrized_structure()
-            spg_num = sga.get_space_group_number()
-            if spg_num == 1:
-                n_still_p1 += 1
-            else:
-                n_changed += 1
+            structure = Structure.from_str(cif, fmt='cif')
+            n_atoms_gt = len(structure)
 
-            if len(sym_struct) != n:
-                raise ValueError("symmetrization changed atom count")  # safety guard, keep original
+            if num_atoms_ref is not None and int(num_atoms_ref[idx]) != n_atoms_gt:
+                n_mismatch += 1
+                print(f'WARNING: gt_file atom count for {mat_id} ({n_atoms_gt}) != '
+                      f'evaluated structure\'s atom count ({int(num_atoms_ref[idx])}) -- '
+                      f'skipping, this looks like a mismatched gt_file or id collision, '
+                      f'not the same material.')
+                n_atoms_out.append(None); e_tot_out.append(float('nan')); e_per_atom_out.append(float('nan'))
+                continue
 
-            out_frac.append(sym_struct.frac_coords)
-            out_lattices.append(sym_struct.lattice.matrix)
-            out_atom_types.append(np.array([s.specie.Z for s in sym_struct]))
-        except Exception:
-            n_exception += 1
-            out_frac.append(fc)
-            out_lattices.append(lat)
-            out_atom_types.append(at)
-    
+            frac = torch.tensor(structure.frac_coords, dtype=torch.float32)
+            lat = torch.tensor(structure.lattice.matrix, dtype=torch.float32)
+            z = torch.tensor([s.specie.Z for s in structure], dtype=torch.long)
+            atoms = _build_ase_atoms(frac, lat, z)
+            atoms.calc = mace_calc
+            e = atoms.get_potential_energy()
+            n_atoms_out.append(n_atoms_gt)
+            e_tot_out.append(float(e))
+            e_per_atom_out.append(float(e) / n_atoms_gt)
+        except Exception as exc:
+            n_failed += 1
+            print(f'WARNING: failed to compute ground-truth MACE energy for {mat_id}: {exc}')
+            n_atoms_out.append(None); e_tot_out.append(float('nan')); e_per_atom_out.append(float('nan'))
 
-    total = len(num_atoms_list)
-    print(f'symmetrize_batch: {n_changed}/{total} found real symmetry, '
-            f'{n_still_p1}/{total} still P1 at symprec={symprec}, '
-            f'{n_exception}/{total} exceptions (fell back to original)')
+    n_ok = len(material_ids) - n_missing - n_failed - n_mismatch
+    print(f'Ground-truth MACE energies: {n_ok}/{len(material_ids)} computed '
+          f'({n_missing} not found in gt_file, {n_mismatch} atom-count mismatch, '
+          f'{n_failed} failed to parse/evaluate).')
+    return n_atoms_out, e_tot_out, e_per_atom_out
 
-    frac_coords_out = torch.tensor(np.concatenate(out_frac), dtype=torch.float32)
-    lattices_out = torch.tensor(np.stack(out_lattices), dtype=torch.float32)
-    atom_types_out = torch.tensor(np.concatenate(out_atom_types), dtype=torch.long)
-    return frac_coords_out, lattices_out, atom_types_out
+def save_initial_structure_cifs(outdir, mat_id, eval_idx, frac_coords, lattice_matrix, atom_types):
+    try:
+        struct = Structure(
+            lattice=Lattice(lattice_matrix.detach().cpu().numpy()),
+            species=atom_types.detach().cpu().numpy(),
+            coords=frac_coords.detach().cpu().numpy(),
+            coords_are_cartesian=False,
+        )
+    except Exception as exc:
+        print(f'WARNING: could not write CIF for {mat_id} (eval {eval_idx}): {exc}')
+        return False
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    struct.to(filename=str(outdir / f'{mat_id}_eval{eval_idx}.cif'), fmt='cif')
+    return True
 
 
-
-def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=False,symmetrize=False, symprec=0.1, **sample_kwargs):
+def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=False,
+          perturb=False,material_ids=None, init_structure_from_batch=True,save_initial_cifs=False,initial_cifs_dir=None, outdir=None, diff_out_name=None,
+        model_path=None,mace_calc=None, mace_stride=1, **sample_kwargs):
     frac_coords = []
     num_atoms = []
     atom_types = []
     lattices = []
-    n_steps_used = []              # <-- ADD
-    final_coord_field_norm = []    # <-- ADD
-    final_lattice_field_norm = []  # <-- ADD
-    coord_norm_traj_all = []    # <-- ADD
-    lattice_norm_traj_all = []  # <-- ADD
+    n_steps_used = []
+    coord_norm_traj_all, lattice_norm_traj_all = [], []
+    mace_traj_all = []   
     input_data_list = []
     device = next(model.parameters()).device
+    struct_offset = 0
+
+    def _write_initial_cifs(frac0, lat0, atom_types_, num_atoms_, eval_idx):
+        frac_per_graph = torch.split(frac0, num_atoms_.tolist(), dim=0)
+        z_per_graph = torch.split(atom_types_, num_atoms_.tolist(), dim=0)
+        for local_i in range(num_atoms_.shape[0]):
+            global_i = struct_offset + local_i
+            mat_id = material_ids[global_i] if material_ids is not None else f'graph_{global_i}'
+            save_initial_structure_cifs(initial_cifs_dir, mat_id, eval_idx,
+                                         frac_per_graph[local_i], lat0[local_i],
+                                         z_per_graph[local_i])
+    
 
     for idx, batch in enumerate(loader):
         if torch.cuda.is_available():
             batch.cuda()
         batch_frac_coords, batch_num_atoms, batch_atom_types = [], [], []
-        batch_n_steps_used, batch_final_coord_norm, batch_final_lattice_norm = [], [], []
+        batch_n_steps_used= []
         batch_lattices = []
         batch_coord_traj, batch_lattice_traj = [], []
+        batch_mace = []  
+    
         for eval_idx in range(num_evals):
             print(f'batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}')
-            init_structure = {
-            'frac_coords': batch.frac_coords,
-            'lattices_mat': lattice_params_to_matrix_torch(batch.lengths, batch.angles),
-            }
+            init_structure = None
+            if perturb:
+                init_structure = perturb_batch(
+                    batch, coord_noise, lattice_noise, device, model)
+            elif init_structure_from_batch:
+                init_structure = {
+                    'frac_coords': batch.frac_coords,
+                    'lattices_mat': lattice_params_to_matrix_torch(batch.lengths, batch.angles),
+                }
             if null_baseline:
-                # skip the model entirely -- "output" IS the initial structure,
-                # i.e. what a "do nothing" relaxer would produce
+                if init_structure is None:
+                    raise ValueError(
+                        "null_baseline needs an actual starting structure to work with")
                 out_frac = init_structure['frac_coords'].detach().cpu()
                 out_lattices = init_structure['lattices_mat'].detach().cpu()
                 out_num_atoms = batch.num_atoms.detach().cpu()
                 out_atom_types = batch.atom_types.detach().cpu()
-                out_coord_traj = torch.zeros(0, batch.num_graphs)   # <-- ADD: nothing to record
-                out_lattice_traj = torch.zeros(0, batch.num_graphs) # <-- ADD
+                out_coord_traj = torch.zeros(0, batch.num_graphs)
+                out_lattice_traj = torch.zeros(0, batch.num_graphs)
+                out_mace = None   
 
-                # no sampling happened, so these have no meaning -- fill with
-                # NaN rather than 0, so they're visibly "not applicable"
-                # rather than silently misread as "converged instantly"
                 batch_size = batch.num_graphs
                 nan_placeholder = torch.full((batch_size,), float('nan'))
                 out_n_steps_used = nan_placeholder
-                out_final_coord_norm = nan_placeholder
-                out_final_lattice_norm = nan_placeholder
+      
             else:
 
-
                 outputs, traj = model.sample(batch, init_structure=init_structure, **sample_kwargs)
+
+
+                lengths, angles = lattices_to_params_shape(traj['all_lattices'])  
+                T = traj['all_frac_coords'].shape[0]
+
+                input_data = Batch.from_data_list(batch.to_data_list()).cpu()
+
+                torch.save({
+                    'input_data_batch': input_data,
+                    'frac_coords': traj['all_frac_coords'].detach().cpu(),
+                    'lengths':     lengths.detach().cpu(),
+                    'angles':      angles.detach().cpu(),
+                    'atom_types':  batch.atom_types.detach().cpu().unsqueeze(0).repeat(T, 1),
+                    'num_atoms':   batch.num_atoms.detach().cpu().unsqueeze(0).repeat(T, 1),
+                },  outdir / diff_out_name)
+                
+                if save_initial_cifs:
+                    _write_initial_cifs(
+                        traj['all_frac_coords'][0].detach().cpu(),
+                        traj['all_lattices'][0].detach().cpu(),
+                        batch.atom_types.detach().cpu(), batch.num_atoms.detach().cpu(),
+                        eval_idx,
+                    )
+
+                print("traj['all_frac_coords'].shape           =", traj['all_frac_coords'].shape)
+                print("traj['all_lattices'].shape            =", traj['all_lattices'].shape)
+
+
+                print("input_data_batch           =", type(input_data))
+                print("input_data_batch.frac_coords.shape =",
+                    input_data.frac_coords.shape)
+                print("input_data_batch.atom_types.shape  =",
+                    input_data.atom_types.shape)
+                print("input_data_batch.lengths.shape     =",
+                    input_data.lengths.shape)
+                print("input_data_batch.angles.shape      =",
+                    input_data.angles.shape)
+                print("input_data_batch.num_atoms.shape   =",
+                    input_data.num_atoms.shape)
+
+
+                out_mace = None
+                if mace_calc is not None:
+                    out_mace = compute_mace_energy_trajectory(
+                        traj['all_frac_coords'], traj['all_lattices'],
+                        batch.num_atoms.detach().cpu(), batch.atom_types.detach().cpu(),
+                        mace_calc, stride=mace_stride,
+                    )
+
                 out_frac = outputs['frac_coords'].detach().cpu()
                 out_lattices = outputs['lattices'].detach().cpu()
                 out_num_atoms = outputs['num_atoms'].detach().cpu()
                 out_atom_types = outputs['atom_types'].detach().cpu()
-                out_coord_traj = traj['coord_field_norm_traj']      # <-- ADD
-                out_lattice_traj = traj['lattice_field_norm_traj']  # <-- ADD
-
-                if symmetrize:
-                    out_frac, out_lattices, out_atom_types = symmetrize_batch(
-                        out_frac, out_lattices, out_atom_types, out_num_atoms, symprec=symprec
-                    )
+                out_coord_traj = traj['coord_field_norm_traj']
+                out_lattice_traj = traj['lattice_field_norm_traj']
                 out_n_steps_used = traj['n_steps_used']
-                out_final_coord_norm = traj['final_coord_field_norm']
-                out_final_lattice_norm = traj['final_lattice_field_norm']
 
 
             batch_frac_coords.append(out_frac)
@@ -241,24 +327,22 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
             batch_atom_types.append(out_atom_types)
             batch_lattices.append(out_lattices)
             batch_n_steps_used.append(out_n_steps_used)
-            batch_final_coord_norm.append(out_final_coord_norm)
-            batch_final_lattice_norm.append(out_final_lattice_norm)
-            batch_coord_traj.append(out_coord_traj)    # <-- ADD
-            batch_lattice_traj.append(out_lattice_traj) # <-- ADD
-
-
+            batch_coord_traj.append(out_coord_traj)
+            batch_lattice_traj.append(out_lattice_traj)
+            batch_mace.append(out_mace)   
+   
 
         frac_coords.append(torch.stack(batch_frac_coords, dim=0))
         num_atoms.append(torch.stack(batch_num_atoms, dim=0))
         atom_types.append(torch.stack(batch_atom_types, dim=0))
         lattices.append(torch.stack(batch_lattices, dim=0))
         n_steps_used.append(torch.stack(batch_n_steps_used, dim=0))
-        final_coord_field_norm.append(torch.stack(batch_final_coord_norm, dim=0))
-        final_lattice_field_norm.append(torch.stack(batch_final_lattice_norm, dim=0))
-        coord_norm_traj_all.append(batch_coord_traj)     # <-- ADD: list of lists (ragged across batches)
-        lattice_norm_traj_all.append(batch_lattice_traj) # <-- ADD
+        coord_norm_traj_all.append(batch_coord_traj)
+        lattice_norm_traj_all.append(batch_lattice_traj)
+        mace_traj_all.append(batch_mace)   
 
         input_data_list = input_data_list + batch.to_data_list()
+        struct_offset += batch.num_graphs
 
     frac_coords = torch.cat(frac_coords, dim=1)
     num_atoms = torch.cat(num_atoms, dim=1)
@@ -266,33 +350,28 @@ def relax(loader, model, num_evals, coord_noise, lattice_noise, null_baseline=Fa
     lattices = torch.cat(lattices, dim=1)
     lengths, angles = lattices_to_params_shape(lattices)
     input_data_batch = Batch.from_data_list(input_data_list)
-    n_steps_used = torch.cat(n_steps_used, dim=1)                       
-    final_coord_field_norm = torch.cat(final_coord_field_norm, dim=1)   
-    final_lattice_field_norm = torch.cat(final_lattice_field_norm, dim=1)  
+    n_steps_used = torch.cat(n_steps_used, dim=1)
+
+    print("mace_traj_all:", type(mace_traj_all), len(mace_traj_all))
+    print("mace_traj_all[0]:", type(mace_traj_all[0]), len(mace_traj_all[0]))
+    print("mace_traj_all[0][0].shape:",type(mace_traj_all[0][0]),  len(mace_traj_all[0][0]))
+
 
     return (
         frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch
-        ,n_steps_used, final_coord_field_norm, final_lattice_field_norm,
+        ,n_steps_used, 
         coord_norm_traj_all, lattice_norm_traj_all,
+        mace_traj_all
     )
+
 
 def save_field_norm_csv(
     csv_path, material_ids, num_atoms, n_steps_used,
     coord_norm_traj_all, lattice_norm_traj_all,
 ):
-    """Per-structure, per-STEP summary CSV: one row per (material_id,
-    eval_idx, step), covering the FULL convergence trajectory rather than
-    just the final norm at freeze time -- lets you plot/inspect how
-    final_coord_field_norm / final_lattice_field_norm actually decay over
-    the sampling trajectory for any given structure.
 
-    coord_norm_traj_all / lattice_norm_traj_all: ragged nested lists,
-    shape [n_batches][num_evals] of tensors [steps_this_batch_ran, batch_size],
-    as returned by relax(). material_ids is a flat list aligned to the
-    structure order relax() iterated (same convention as elsewhere).
-    """
-    num_atoms_np = num_atoms.numpy()          # [num_evals, n_structs]
-    n_steps_np = n_steps_used.numpy()          # [num_evals, n_structs]
+    num_atoms_np = num_atoms.numpy()
+    n_steps_np = n_steps_used.numpy()
 
     n_structs = num_atoms_np.shape[1]
     if material_ids is not None and len(material_ids) != n_structs:
@@ -304,12 +383,11 @@ def save_field_norm_csv(
     rows = []
     struct_offset = 0
     for batch_coord_traj, batch_lattice_traj in zip(coord_norm_traj_all, lattice_norm_traj_all):
-        # batch_coord_traj is a list of length num_evals, each [steps, batch_size]
         batch_size = batch_coord_traj[0].shape[1] if batch_coord_traj[0].numel() > 0 else \
                      batch_lattice_traj[0].shape[1]
 
         for e, (coord_traj, lattice_traj) in enumerate(zip(batch_coord_traj, batch_lattice_traj)):
-            n_steps_this = coord_traj.shape[0]  # 0 for null_baseline
+            n_steps_this = coord_traj.shape[0]
             for local_i in range(batch_size):
                 global_i = struct_offset + local_i
                 mat_id = material_ids[global_i] if material_ids is not None else None
@@ -317,7 +395,6 @@ def save_field_norm_csv(
                 n_steps_used_val = float(n_steps_np[e, global_i])
 
                 if n_steps_this == 0:
-                    # null baseline: no trajectory, one row with NaN norms
                     rows.append({
                         'material_id': mat_id, 'eval_idx': e, 'step': None,
                         'n_atoms': n_atoms_val, 'n_steps_used': n_steps_used_val,
@@ -326,11 +403,6 @@ def save_field_norm_csv(
                     })
                 else:
                     for step in range(n_steps_this):
-                        # keep steps up to and INCLUDING the freeze step so the
-                        # last row's norm matches final_{coord,lattice}_field_norm
-                        # in the .pt (flow.sample indexes coord_norm_traj at
-                        # n_steps_used). step is 0-indexed, n_steps_used_val counts
-                        # steps, so the freeze row is step == n_steps_used_val.
                         if step > n_steps_used_val:
                             break
                         rows.append({
@@ -349,19 +421,52 @@ def save_field_norm_csv(
     return df
 
 
+
+def save_mace_energy_csv(csv_path, material_ids, num_atoms, mace_traj_all):
+    num_atoms_np = num_atoms.numpy()
+    n_structs = num_atoms_np.shape[1]
+
+    if material_ids is not None and len(material_ids) != n_structs:
+        print(f'WARNING: material_id count ({len(material_ids)}) != number of '
+              f'evaluated structures ({n_structs}) -- writing CSV without material_id.')
+        material_ids = None
+
+    rows = []
+    struct_offset = 0
+    for batch_mace in mace_traj_all:
+        batch_size = None
+        for m in batch_mace:
+            if m is not None:
+                batch_size = len(m)
+                break
+        if batch_size is None:
+            continue  # every eval in this batch had no MACE data
+
+        for e, m in enumerate(batch_mace):
+            if m is None:
+                continue
+            for local_i, per_graph in enumerate(m):
+                global_i = struct_offset + local_i
+                mat_id = material_ids[global_i] if material_ids is not None else None
+                n_atoms_val = int(num_atoms_np[e, global_i])
+                for step, e_tot, e_pa in zip(per_graph['steps'], per_graph['energy_total_eV'],
+                                              per_graph['energy_per_atom_eV']):
+                    rows.append({
+                        'material_id': mat_id, 'eval_idx': e, 'step': step,
+                        'n_atoms': n_atoms_val,
+                        'energy_total_eV': e_tot, 'energy_per_atom_eV': e_pa,
+                    })
+        struct_offset += batch_size
+
+    df = pd.DataFrame(rows)
+    df.to_csv(csv_path, index=False)
+    print(f'Saved MACE energy trajectory ({len(df)} rows, '
+          f'{df["material_id"].nunique() if material_ids is not None and len(df) else n_structs} '
+          f'structures) to {csv_path}')
+    return df
+
+
 def build_split_loader(cfg, model, split, test_bs=None):
-    """Build a non-shuffled loader over the train / val / test split straight
-    from the saved config, assigning the model's scalers to each dataset.
-
-    This deliberately bypasses CrystDataModule.setup(): its 'fit' branch does
-    `self.train_dataset.lattice_scaler = ...` guarded by
-    `if not hasattr(self, "train_dataset")`, but __init__ always creates that
-    attribute (as None), so when load_model passes a scaler_path the train
-    dataset is never instantiated and setup() raises AttributeError on None.
-
-    Returns (loader, dataset_cfgs) -- dataset_cfgs is the list of dataset
-    configs backing the loader, for material_id lookup.
-    """
     ds_group = cfg.data.datamodule.datasets
     if split == 'train':
         ds_cfgs = [ds_group.train]
@@ -394,10 +499,12 @@ def build_split_loader(cfg, model, split, test_bs=None):
 
 
 def main(args):
-    # load_data if do reconstruction.
+
     model_path = Path(args.model_path)
-    # load_data=False: we build the loader ourselves via build_split_loader so
-    # --split train/val also works (load_model's testing=False path is broken).
+
+    outdir = Path(args.outdir) if args.outdir else model_path
+    outdir.mkdir(parents=True, exist_ok=True)
+
     model, _, cfg = load_model(model_path, load_data=False, test_bs=args.test_bs)
 
     if torch.cuda.is_available():
@@ -418,7 +525,35 @@ def main(args):
         print(f'WARNING: multiple {args.split} datasets configured -- material_id '
               'retrieval not implemented for this case, saving without it.')
 
+    if args.perturb and args.from_noise:
+        print("NOTE: both --perturb and --from_noise were passed -- --perturb "
+              "takes precedence (init_structure is built from the rattled "
+              "ground-truth structure, NOT random noise). Pass only one if "
+              "that's not what you meant.")
 
+    mace_calc = None
+    if args.mace_energy_check:
+        if args.eval_size is None or args.eval_size > 50:
+            print(f"WARNING: --mace_energy_check is a manual, small-N sanity "
+                  f"check (computes energy at every step, per structure) -- "
+                  f"you have --eval_size={args.eval_size}. This is meant for "
+                  f"~5-20 materials, not a full-dataset run; consider adding "
+                  f"--eval_size 5 unless you really mean to run this at scale.")
+        mace_device = args.mace_device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        mace_calc = build_mace_calculator(args.mace_model, mace_device,
+                                           default_dtype=args.mace_default_dtype,
+                                           dispersion=args.mace_dispersion)
+
+    if args.gt_file is not None:
+        if not args.mace_energy_check:
+            raise SystemExit(
+                "--gt_file needs --mace_energy_check too (that's what builds "
+                "the MACE calculator used to score the ground-truth structures).")
+        if material_ids is None:
+            raise SystemExit(
+                "--gt_file needs material_ids to match ground-truth structures "
+                "against -- material_id lookup failed above (see the WARNING "
+                "printed for the loaded split), so --gt_file can't be used here.")
 
     print('Perturb-and-recover evaluation (relaxation feasibility test).')
 
@@ -433,12 +568,29 @@ def main(args):
             "is a sentinel and is not resolved by this script."
         )
 
+    if args.label == '':
+        diff_out_name = 'eval_diff.pt'
+        csv_out_name = 'eval_field_norms.csv'
+        mace_csv_out_name = 'eval_mace_energy.csv'
+    else:
+        diff_out_name = f'eval_diff_{args.label}.pt'
+        csv_out_name = f'eval_field_norms_{args.label}.csv'
+        mace_csv_out_name = f'eval_mace_energy_{args.label}.csv'
+
+
     start_time = time.time()
     (frac_coords, atom_types, lattices, lengths, angles, num_atoms, input_data_batch,
-     n_steps_used, final_coord_field_norm, final_lattice_field_norm,coord_norm_traj_all, lattice_norm_traj_all) = relax(
+     n_steps_used, coord_norm_traj_all, lattice_norm_traj_all, mace_traj_all) = relax(
         test_loader, model, num_evals=args.num_evals,
         coord_noise=args.coord_noise, lattice_noise=args.lattice_noise,
-        symmetrize=args.symmetrize, symprec=args.symprec,        
+        perturb=args.perturb,
+        init_structure_from_batch=not args.from_noise,
+        material_ids=material_ids, save_initial_cifs=args.save_initial_cifs,
+        initial_cifs_dir=(outdir / 'initial_structures') if args.save_initial_cifs else None,
+        outdir=outdir,
+        model_path=model_path,
+        diff_out_name = diff_out_name,
+        mace_calc=mace_calc, mace_stride=args.mace_stride,
         null_baseline=args.null_baseline,
         N=N, eta=args.eta, sampler=args.sampler, mu=args.mu,
         anneal_lattice=args.anneal_lattice, anneal_coords=args.anneal_coords, anneal_type=args.anneal_type, anneal_slope=args.anneal_slope, anneal_offset=args.anneal_offset,
@@ -446,44 +598,88 @@ def main(args):
         grad_stop=args.grad_stop, grad_stop_coord=args.grad_stop_coord, grad_stop_lattice=args.grad_stop_lattice, min_steps=args.min_steps
     )
 
-    if args.label == '':
-        diff_out_name = 'eval_diff.pt'
-        csv_out_name = 'eval_field_norms.csv'
-    else:
-        diff_out_name = f'eval_diff_{args.label}.pt'
-        csv_out_name = f'eval_field_norms_{args.label}.csv'
- 
+    print("\n===== RELAX OUTPUT SHAPES =====")
 
-    torch.save({
-        'eval_setting': args,
-        'input_data_batch': input_data_batch,
-        'frac_coords': frac_coords,
-        'num_atoms': num_atoms,
-        'atom_types': atom_types,
-        'lattices': lattices,
-        'lengths': lengths,
-        'angles': angles,
-        'time': time.time() - start_time,
-        'n_steps_used': n_steps_used,
-        'final_coord_field_norm': final_coord_field_norm, 
-        'final_lattice_field_norm': final_lattice_field_norm,  
-    }, model_path / diff_out_name)
+    print("frac_coords.shape          =", frac_coords.shape)
+    print("atom_types.shape           =", atom_types.shape)
+    print("lattices.shape             =", lattices.shape)
+    print("lengths.shape              =", lengths.shape)
+    print("angles.shape               =", angles.shape)
+    print("num_atoms.shape            =", num_atoms.shape)
+    print("input_data_batch           =", type(input_data_batch))
+    print("input_data_batch.frac_coords.shape =",
+        input_data_batch.frac_coords.shape)
+    print("input_data_batch.atom_types.shape  =",
+        input_data_batch.atom_types.shape)
+    print("input_data_batch.lengths.shape     =",
+        input_data_batch.lengths.shape)
+    print("input_data_batch.angles.shape      =",
+        input_data_batch.angles.shape)
+    print("input_data_batch.num_atoms.shape   =",
+        input_data_batch.num_atoms.shape)
+
+    print("coord_norm_traj_all:", type(coord_norm_traj_all), len(coord_norm_traj_all))
+    print("coord_norm_traj_all[0]:", type(coord_norm_traj_all[0]), len(coord_norm_traj_all[0]))
+    print("coord_norm_traj_all[0][0].shape:", coord_norm_traj_all[0][0].shape)
+
+    print("lattice_norm_traj_all[0][0].shape:", lattice_norm_traj_all[0][0].shape)
 
 
-    print(f'Saved to {model_path / diff_out_name}')
+    # torch.save({
+    #     'eval_setting': args,
+    #     'input_data_batch': input_data_batch,
+    #     'frac_coords': frac_coords,
+    #     'num_atoms': num_atoms,
+    #     'atom_types': atom_types,
+    #     'lattices': lattices,
+    #     'lengths': lengths,
+    #     'angles': angles,
+    #     'time': time.time() - start_time,
+    #     'n_steps_used': n_steps_used,
+    # }, outdir / diff_out_name)
 
-        
+    # print(f'Saved to {outdir / diff_out_name}')
+
     save_field_norm_csv(
-        model_path / csv_out_name,
+        outdir / csv_out_name,
         material_ids, num_atoms, n_steps_used,
         coord_norm_traj_all, lattice_norm_traj_all,
     )
- 
+
+    if args.mace_energy_check:
+        save_mace_energy_csv(
+            outdir / mace_csv_out_name,
+            material_ids, num_atoms,
+            mace_traj_all,
+        )
+
+    if args.gt_file is not None:
+        gt_csv_out_name = 'eval_gt_energy.csv' if args.label == '' else f'eval_gt_energy_{args.label}.csv'
+        gt_n_atoms, gt_e_tot, gt_e_per_atom = load_ground_truth_energies(
+            args.gt_file, material_ids, mace_calc, num_atoms_ref=num_atoms[0].tolist(),
+        )
+        gt_df = pd.DataFrame({
+            'material_id': material_ids,
+            'n_atoms': gt_n_atoms,
+            'gt_energy_total_eV': gt_e_tot,
+            'gt_energy_per_atom_eV': gt_e_per_atom,
+        })
+        gt_df.to_csv(outdir / gt_csv_out_name, index=False)
+        print(f'Saved ground-truth MACE energies ({len(gt_df)} rows) to '
+              f'{outdir / gt_csv_out_name}')
+
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-m', '--model_path', required=True)
+    parser.add_argument('--outdir', default=None,
+                     help='where this run writes its outputs (eval_diff*.pt, '
+                          'eval_diff_traj.pt, the CSVs, initial_structures/) -- '
+                          'default: same as --model_path (old behavior). Point '
+                          'this at a per-experiment folder to keep repeated runs '
+                          'against the same model from overwriting each other.')
+
     parser.add_argument('--num_evals', metavar='NEVAL', default=1, type=int, help="num repeat for each sample.")
     parser.add_argument('--test_bs', type=int, help="overwrite testset batchsize.")
     parser.add_argument('--label', default='', help="label for output")
@@ -516,22 +712,63 @@ if __name__ == '__main__':
                                 help='stddev of fractional-coord Gaussian rattle')
     perturb_group.add_argument('--lattice_noise', type=float, default=0.02,
                                 help='relative stddev on lengths / scale factor on angle noise (degrees)')
+    perturb_group.add_argument('--from_noise', action='store_true',
+                                help='sample from random noise (pure generation), for getting '
+                                     "generation-mode data -- NOT the same thing as "
+                                     "--null_baseline. This still calls model.sample() and runs "
+                                     "the full sampler; --null_baseline instead skips the model "
+                                     "entirely and echoes the input structure back unchanged, "
+                                     "which is why it needs a real input and is incompatible "
+                                     "with this flag. Default is OFF -- i.e. relax from "
+                                     "ground truth, which is this script's whole purpose.")
+    perturb_group.add_argument('--perturb', action='store_true',
+                                help='initialize the sampler from a perturbed (rattled) structure '
+                                     'instead of the ground-truth init structure')
 
 
     parser.add_argument('--null_baseline', action='store_true',
                      help='skip the model, evaluate the distortion itself (sanity check)')
-    
+
     step_group.add_argument('--grad-stop', dest='grad_stop', type=float, default=None,
                          help="EqM adaptive early stop: field-norm threshold")
     step_group.add_argument('--min-steps', dest='min_steps', type=int, default=1)
 
 
-    parser.add_argument('--symmetrize', action='store_true',
-                         help='apply post-hoc SpacegroupAnalyzer symmetrization to the final structure')
-    parser.add_argument('--symprec', type=float, default=0.1,
-                         help='symmetry-finding tolerance for --symmetrize')
+    mace_group = parser.add_argument_group(
+        'MACE energy check (manual, small-N diagnostic -- NOT for full-dataset runs)')
+    mace_group.add_argument('--mace_energy_check', action='store_true',
+                         help='compute MACE-predicted energy at each sampling step, per '
+                              'structure, via ASE. Requires ase and mace-torch to be '
+                              'installed -- both are imported lazily, only if this flag '
+                              'is passed. Meant for --eval_size ~5-20, not full-dataset runs.')
+    mace_group.add_argument('--mace-model', dest='mace_model', default='medium',
+                         help="mace_mp foundation-model size ('small'/'medium'/'large'), "
+                              "OR a path to a custom .model checkpoint (auto-detected). "
+                              "The foundation model downloads weights on first use.")
+    mace_group.add_argument('--mace_device', default=None, help='cuda/cpu; default: auto')
+    mace_group.add_argument('--mace_stride', type=int, default=1,
+                         help='compute energy every Nth step (default: every step -- '
+                              'cheap at small --eval_size)')
+    mace_group.add_argument('--mace_default_dtype', default='float32',
+                         help="MACE calculator precision. Default 'float32' -- NOTE this "
+                              "differs from mace_relax_single_cif.py's default ('float64'); "
+                              "if comparing energies between the two tools, set this to "
+                              "match whichever you're comparing against.")
+    mace_group.add_argument('--mace_dispersion', action='store_true',
+                         help='include a Grimme D3-style dispersion correction on top of '
+                              'the raw MACE energy. Default OFF, matching the project\'s '
+                              'other MACE scripts -- previously this was left unset here '
+                              '(relying on mace_mp\'s own implicit default), now pinned '
+                              'explicitly.')
+    mace_group.add_argument('--gt_file', default=None,
+                         help="CSV with 'material_id' and 'cif' columns (same convention "
+                              "as compute_metrics.py's --gt_file) -- if given, also computes "
+                              "MACE energy of the true ground-truth structure for each "
+                              "material, matched by material_id (not row position), saved "
+                              "to eval_gt_energy.csv. Requires --mace_energy_check.")
 
-    
+
+
     parser.add_argument('--eval_size', type=int, default=None,
                          help='evaluate on a random subsample of this many structures '
                               'instead of the full test set (for fast iteration); '
@@ -546,5 +783,14 @@ if __name__ == '__main__':
     step_group.add_argument('--grad-stop-lattice', dest='grad_stop_lattice', type=float, default=None,
                          help="EqM adaptive early stop: lattice-field-norm threshold (overrides --grad-stop for lattice)")
 
+     
+    parser.add_argument('--save_initial_cifs', action='store_true',
+                     help='also write one .cif file per (material_id, eval_idx) for the '
+                          'STARTING structure, to initial_structures/ next to the checkpoint '
+                          '-- for opening directly in VESTA/OVITO/pymatgen. Off by default: '
+                          'writes one file per material, wasteful at full-dataset scale. The '
+                          'summary CSV (eval_initial_structure*.csv) is always written '
+                          'regardless of this flag.')
+
     args = parser.parse_args()
-    main(args) 
+    main(args)

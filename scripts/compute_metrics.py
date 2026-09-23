@@ -453,7 +453,8 @@ class RecEvalBatch(object):
                 rms_dists.append(None)
             else:
                 rms_dists.append(np.min(tmp_rms_dists))
-
+        print("RMS distances for each prediction in the batch:")
+        print(self.all_rms_dis)
         rms_dists = np.array(rms_dists)
         match_rate = sum(rms_dists != None) / len(self.preds[0])
         mean_rms_dist = rms_dists[rms_dists != None].mean()
@@ -717,6 +718,7 @@ def main(args):
     else:
 
         recon_file_path = get_file_paths(args.root_path, 'diff', args.label)
+        print(f"Loading recon file from {recon_file_path}")
         batch_idx = -1 if args.multi_eval else 0
         crys_array_list, true_crystal_array_list = get_crystal_array_list(
             recon_file_path, batch_idx = batch_idx)
